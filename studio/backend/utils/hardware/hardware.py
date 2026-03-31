@@ -100,14 +100,7 @@ def detect_hardware() -> DeviceType:
             print(f"Hardware detected: CUDA — {device_name}")
             return DEVICE
 
-<<<<<<< Updated upstream
-    # --- XPU: Intel GPU ---
-    if _has_torch():
-        import torch
-
-=======
         # --- XPU: Intel GPU ---
->>>>>>> Stashed changes
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             DEVICE = DeviceType.XPU
             CHAT_ONLY = False
@@ -228,11 +221,7 @@ def get_gpu_memory_info() -> Dict[str, Any]:
                 "utilization_pct": (allocated / total) * 100,
             }
         except Exception as e:
-<<<<<<< Updated upstream
             logger.error("Error getting XPU GPU info: %s", e)
-=======
-            logger.error(f"Error getting XPU GPU info: {e}")
->>>>>>> Stashed changes
             return {"available": False, "backend": device.value, "error": str(e)}
 
     # ---- MLX path (Apple Silicon) ----
@@ -337,9 +326,64 @@ def get_package_versions() -> Dict[str, Optional[str]]:
     return versions
 
 
-<<<<<<< Updated upstream
 # ========== Torch-based GPU fallbacks (AMD ROCm, Intel XPU, nvidia-smi missing) ==========
-=======
+
+
+def _torch_get_device_module():
+    """Return the appropriate torch device module (cuda or xpu) and its name."""
+    device = get_device()
+    import torch
+
+    if device == DeviceType.CUDA:
+        return torch.cuda, "cuda"
+    if device == DeviceType.XPU and hasattr(torch, "xpu"):
+        return torch.xpu, "xpu"
+    return None, None
+
+
+def _torch_get_physical_gpu_count() -> Optional[int]:
+    mod, _ = _torch_get_device_module()
+    if mod is None:
+        return None
+    try:
+        return mod.device_count()
+    except Exception:
+        return None
+
+
+def _torch_get_per_device_info(device_indices: list[int]) -> list[Dict[str, Any]]:
+    """Query torch for per-GPU name, total VRAM, and used VRAM."""
+    mod, _ = _torch_get_device_module()
+    if mod is None:
+        return []
+
+    devices = []
+    for ordinal, phys_idx in enumerate(device_indices):
+        try:
+            # torch uses 0-based ordinals relative to CUDA_VISIBLE_DEVICES
+            props = mod.get_device_properties(ordinal)
+            total_bytes = props.total_memory
+            # Prefer mem_get_info (reports system-wide usage, not just this
+            # process) so auto-selection accounts for other GPU consumers.
+            if hasattr(mod, "mem_get_info"):
+                free_bytes, total_bytes = mod.mem_get_info(ordinal)
+                used_bytes = total_bytes - free_bytes
+            else:
+                used_bytes = mod.memory_allocated(ordinal)
+            devices.append(
+                {
+                    "index": phys_idx,
+                    "visible_ordinal": ordinal,
+                    "name": props.name,
+                    "total_gb": round(total_bytes / (1024**3), 2),
+                    "used_gb": round(used_bytes / (1024**3), 2),
+                }
+            )
+        except Exception as e:
+            logger.debug("torch device query failed for ordinal %d: %s", ordinal, e)
+    return devices
+
+
 # ========== Live GPU Utilization ==========
 
 
@@ -411,80 +455,11 @@ def _get_xpu_utilization() -> Dict[str, Any]:
 
 
 def get_gpu_utilization() -> Dict[str, Any]:
-    """
-    Return a live snapshot of GPU utilization via ``nvidia-smi``.
->>>>>>> Stashed changes
-
-
-def _torch_get_device_module():
-    """Return the appropriate torch device module (cuda or xpu) and its name."""
-    device = get_device()
-    import torch
-
-<<<<<<< Updated upstream
-    if device == DeviceType.CUDA:
-        return torch.cuda, "cuda"
-    if device == DeviceType.XPU and hasattr(torch, "xpu"):
-        return torch.xpu, "xpu"
-    return None, None
-=======
-    if device == DeviceType.XPU:
-        return _get_xpu_utilization()
-
-    if device != DeviceType.CUDA:
-        return {"available": False, "backend": device.value}
->>>>>>> Stashed changes
-
-
-def _torch_get_physical_gpu_count() -> Optional[int]:
-    mod, _ = _torch_get_device_module()
-    if mod is None:
-        return None
-    try:
-        return mod.device_count()
-    except Exception:
-        return None
-
-
-def _torch_get_per_device_info(device_indices: list[int]) -> list[Dict[str, Any]]:
-    """Query torch for per-GPU name, total VRAM, and used VRAM."""
-    mod, _ = _torch_get_device_module()
-    if mod is None:
-        return []
-
-    devices = []
-    for ordinal, phys_idx in enumerate(device_indices):
-        try:
-            # torch uses 0-based ordinals relative to CUDA_VISIBLE_DEVICES
-            props = mod.get_device_properties(ordinal)
-            total_bytes = props.total_memory
-            # Prefer mem_get_info (reports system-wide usage, not just this
-            # process) so auto-selection accounts for other GPU consumers.
-            if hasattr(mod, "mem_get_info"):
-                free_bytes, total_bytes = mod.mem_get_info(ordinal)
-                used_bytes = total_bytes - free_bytes
-            else:
-                used_bytes = mod.memory_allocated(ordinal)
-            devices.append(
-                {
-                    "index": phys_idx,
-                    "visible_ordinal": ordinal,
-                    "name": props.name,
-                    "total_gb": round(total_bytes / (1024**3), 2),
-                    "used_gb": round(used_bytes / (1024**3), 2),
-                }
-            )
-        except Exception as e:
-            logger.debug("torch device query failed for ordinal %d: %s", ordinal, e)
-    return devices
-
-
-# ========== Live GPU Utilization ==========
-
-
-def get_gpu_utilization() -> Dict[str, Any]:
     """Return a live snapshot of device utilization information."""
     device = get_device()
+
+    if device == DeviceType.XPU:
+        return _get_xpu_utilization()
 
     if device == DeviceType.CUDA:
         try:
@@ -1192,12 +1167,8 @@ def get_physical_gpu_count() -> int:
     """
     Return the number of physical GPUs on the machine.
 
-<<<<<<< Updated upstream
     Uses ``nvidia-smi -L`` on NVIDIA (unaffected by CUDA_VISIBLE_DEVICES),
     with a torch-based fallback for AMD ROCm and Intel XPU.
-=======
-    For NVIDIA uses ``nvidia-smi -L``; for Intel XPU uses ``torch.xpu.device_count()``.
->>>>>>> Stashed changes
     Result is cached after the first call.
     """
     global _physical_gpu_count
@@ -1205,20 +1176,6 @@ def get_physical_gpu_count() -> int:
         return _physical_gpu_count
 
     device = get_device()
-<<<<<<< Updated upstream
-=======
-
-    if device == DeviceType.XPU:
-        try:
-            import torch
-            _physical_gpu_count = torch.xpu.device_count()
-        except Exception:
-            _physical_gpu_count = 1
-        return _physical_gpu_count
-
-    try:
-        import subprocess
->>>>>>> Stashed changes
 
     if device == DeviceType.CUDA:
         try:
@@ -1359,11 +1316,7 @@ def get_visible_gpu_count() -> int:
     if _visible_gpu_count is not None:
         return _visible_gpu_count
 
-<<<<<<< Updated upstream
-=======
-    # Check XPU visibility env var or CUDA_VISIBLE_DEVICES
-    import os
-
+    # Check XPU visibility env var
     device = get_device()
 
     if device == DeviceType.XPU:
@@ -1382,7 +1335,6 @@ def get_visible_gpu_count() -> int:
             _visible_gpu_count = get_physical_gpu_count()
         return _visible_gpu_count
 
->>>>>>> Stashed changes
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if cuda_visible is not None:
         # "" means zero GPUs, "0" means 1, "0,1,2" means 3
@@ -1407,7 +1359,6 @@ def get_visible_gpu_count() -> int:
     return _visible_gpu_count
 
 
-<<<<<<< Updated upstream
 def apply_gpu_ids(gpu_ids) -> None:
     if gpu_ids is None:
         return
@@ -1491,7 +1442,8 @@ def raise_if_offloaded(model, device_map: str, context: str = "Loading") -> None
         f"{context} does not support models loaded with CPU or disk offload. "
         f"device_map='{device_map}' produced offloaded modules: {example}"
     )
-=======
+
+
 def get_torch_device_str() -> str:
     """
     Return the torch device string for the detected hardware.
@@ -1503,7 +1455,6 @@ def get_torch_device_str() -> str:
     elif device == DeviceType.XPU:
         return "xpu"
     return "cpu"
->>>>>>> Stashed changes
 
 
 def safe_num_proc(desired: Optional[int] = None) -> int:
