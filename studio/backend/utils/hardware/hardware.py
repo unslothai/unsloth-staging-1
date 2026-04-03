@@ -319,7 +319,7 @@ def get_package_versions() -> Dict[str, Optional[str]]:
 
         versions["cuda"] = getattr(torch.version, "cuda", None)
         if hasattr(torch, "xpu") and torch.xpu.is_available():
-            versions["xpu"] = True
+            versions["xpu"] = getattr(torch.version, "xpu", "available")
     except Exception:
         versions["cuda"] = None
 
@@ -389,37 +389,48 @@ def _torch_get_per_device_info(device_indices: list[int]) -> list[Dict[str, Any]
 
 def _get_xpu_utilization() -> Dict[str, Any]:
     """Return a live snapshot of Intel XPU GPU utilization via ``xpu-smi`` or torch.xpu."""
+    gpu_util = None
+    temp = None
+    power_w = None
+
+    # Resolve which physical device to query
+    dev_idx = 0
+    try:
+        import torch
+
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            dev_idx = torch.xpu.current_device()
+    except Exception:
+        pass
+
     try:
         import subprocess
 
+        # xpu-smi metric IDs: 0 = GPU Utilization (%), 2 = GPU Power (W),
+        # 3 = GPU Core Temperature (C).
+        # -n 1 requests exactly one sample so the command exits immediately.
+        # CSV columns: Timestamp, DeviceId, <metric0>, <metric1>, <metric2>
         result = subprocess.run(
-            ["xpu-smi", "dump", "-d", "0", "-m", "0,1,2,18"],
+            ["xpu-smi", "dump", "-d", str(dev_idx), "-m", "0,2,3", "-n", "1"],
             capture_output = True,
             text = True,
-            timeout = 5,
+            timeout = 10,
         )
         if result.returncode == 0 and result.stdout.strip():
-            # xpu-smi dump outputs CSV: Timestamp, DeviceId, GPU Utilization (%), ...
             lines = result.stdout.strip().splitlines()
             for line in reversed(lines):
                 if line.startswith("Timestamp") or line.startswith("#"):
                     continue
                 parts = [p.strip() for p in line.split(",")]
-                if len(parts) >= 4:
+                if len(parts) >= 5:
                     gpu_util = float(parts[2]) if parts[2] not in ("", "N/A") else None
-                    temp = float(parts[3]) if parts[3] not in ("", "N/A") else None
+                    power_w = float(parts[3]) if parts[3] not in ("", "N/A") else None
+                    temp = float(parts[4]) if parts[4] not in ("", "N/A") else None
                     break
-            else:
-                gpu_util = None
-                temp = None
-        else:
-            gpu_util = None
-            temp = None
     except Exception:
-        gpu_util = None
-        temp = None
+        pass
 
-    # Get VRAM from torch.xpu
+    # Get VRAM from torch.xpu (only reports PyTorch-managed memory)
     vram_used_gb = None
     vram_total_gb = None
     try:
@@ -450,7 +461,7 @@ def _get_xpu_utilization() -> Dict[str, Any]:
         "vram_used_gb": vram_used_gb,
         "vram_total_gb": vram_total_gb,
         "vram_utilization_pct": vram_pct,
-        "power_draw_w": None,
+        "power_draw_w": power_w,
         "power_limit_w": None,
         "power_utilization_pct": None,
     }
@@ -1354,10 +1365,7 @@ def get_visible_gpu_count() -> int:
     try:
         import torch
 
-        if get_device() == DeviceType.XPU and hasattr(torch, "xpu"):
-            _visible_gpu_count = torch.xpu.device_count()
-        else:
-            _visible_gpu_count = torch.cuda.device_count()
+        _visible_gpu_count = torch.cuda.device_count()
     except Exception:
         _visible_gpu_count = get_physical_gpu_count()
 
