@@ -1345,17 +1345,29 @@ def get_visible_gpu_count() -> int:
             xpu_visible = xpu_visible.strip()
             if xpu_visible == "":
                 _visible_gpu_count = 0
-            else:
-                _visible_gpu_count = len(
-                    [x for x in xpu_visible.split(",") if x.strip()]
-                )
-            return _visible_gpu_count
+                return _visible_gpu_count
+
+        # Prefer torch.xpu.device_count() as it correctly interprets
+        # ZE_AFFINITY_MASK including subdevice syntax (e.g. "0.0,0.1").
         try:
             import torch
 
             _visible_gpu_count = torch.xpu.device_count()
         except Exception:
-            _visible_gpu_count = get_physical_gpu_count()
+            if xpu_visible:
+                # Fallback: count unique root device IDs from the mask.
+                # ZE_AFFINITY_MASK can use "device.subdevice" notation,
+                # so "0.0,0.1" is 1 root device, not 2.
+                roots = set()
+                for token in xpu_visible.split(","):
+                    token = token.strip()
+                    if token:
+                        root = token.split(".", 1)[0]
+                        if root.isdigit():
+                            roots.add(int(root))
+                _visible_gpu_count = len(roots) if roots else 0
+            else:
+                _visible_gpu_count = get_physical_gpu_count()
         return _visible_gpu_count
 
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
