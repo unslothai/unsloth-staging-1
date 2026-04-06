@@ -618,8 +618,8 @@ def _is_vision_model_subprocess(
         return None
 
 
-def _is_vlm_config(config, allow_arch_suffix = True):
-    # type: (Any, bool) -> bool
+def _is_vlm_config(config):
+    # type: (Any) -> bool
     if isinstance(config, dict):
         model_type = config.get("model_type")
         architectures = config.get("architectures")
@@ -636,13 +636,14 @@ def _is_vlm_config(config, allow_arch_suffix = True):
     if model_type in _AUDIO_ONLY_MODEL_TYPES:
         return False
 
+    if architectures:
+        if any(x.endswith(_VLM_ARCH_SUFFIXES) for x in architectures):
+            return True
+
     if has_vision_config or has_img_processor or has_image_token_index:
         return True
     if model_type in _VLM_MODEL_TYPES:
         return True
-    if allow_arch_suffix and architectures:
-        if any(x.endswith(_VLM_ARCH_SUFFIXES) for x in architectures):
-            return True
     return False
 
 
@@ -708,7 +709,7 @@ def is_vision_model(model_name: str, hf_token: Optional[str] = None) -> bool:
         # Subprocess failed or timed out -- fall back to raw config.json
         config_data = _load_model_config_metadata(model_name, hf_token = hf_token)
         if config_data is not None:
-            if _is_vlm_config(config_data, allow_arch_suffix = False):
+            if _is_vlm_config(config_data):
                 logger.info(
                     "Model %s detected as VLM from raw config metadata: "
                     "model_type=%s architectures=%s",
@@ -734,7 +735,7 @@ def is_vision_model(model_name: str, hf_token: Optional[str] = None) -> bool:
     # is still valid).
     config_data = _load_model_config_metadata(model_name, hf_token = hf_token)
     if config_data is not None:
-        return _is_vlm_config(config_data, allow_arch_suffix = False)
+        return _is_vlm_config(config_data)
     return False
 
 
