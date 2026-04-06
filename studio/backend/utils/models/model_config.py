@@ -558,7 +558,7 @@ try:
             is_vlm = True
         if not is_vlm and getattr(config, "image_token_id", None) is not None:
             is_vlm = True
-        if not is_vlm and hasattr(config, "architectures"):
+        if not is_vlm and getattr(config, "architectures", None):
             is_vlm = any(
                 x.endswith("ForVisionText2Text")
                 for x in config.architectures
