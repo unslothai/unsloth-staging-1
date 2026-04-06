@@ -659,12 +659,13 @@ def _load_model_config_metadata(
 
         from huggingface_hub import hf_hub_download
 
+        resolved_name = resolve_cached_repo_id_case(model_name)
         download_kwargs = {}  # type: Dict[str, Any]
         if hf_token:
             download_kwargs["token"] = hf_token
 
         config_path = hf_hub_download(
-            repo_id = model_name,
+            repo_id = resolved_name,
             filename = "config.json",
             **download_kwargs,
         )
