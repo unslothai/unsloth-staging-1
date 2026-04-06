@@ -550,13 +550,13 @@ try:
 
     is_vlm = False
     if model_type not in audio_only_types:
-        if hasattr(config, "vision_config"):
+        if getattr(config, "vision_config", None) is not None:
             is_vlm = True
-        if not is_vlm and hasattr(config, "img_processor"):
+        if not is_vlm and getattr(config, "img_processor", None) is not None:
             is_vlm = True
-        if not is_vlm and hasattr(config, "image_token_index"):
+        if not is_vlm and getattr(config, "image_token_index", None) is not None:
             is_vlm = True
-        if not is_vlm and hasattr(config, "image_token_id"):
+        if not is_vlm and getattr(config, "image_token_id", None) is not None:
             is_vlm = True
         if not is_vlm and hasattr(config, "architectures"):
             is_vlm = any(
@@ -651,23 +651,23 @@ def _is_vlm_config(config: Any) -> bool:
     if isinstance(config, dict):
         model_type = config.get("model_type")
         architectures = config.get("architectures")
-        has_vision_config = "vision_config" in config
-        has_img_processor = "img_processor" in config
-        has_image_token_index = "image_token_index" in config
-        has_image_token_id = "image_token_id" in config
+        vision_config = config.get("vision_config")
+        img_processor = config.get("img_processor")
+        image_token_index = config.get("image_token_index")
+        image_token_id = config.get("image_token_id")
     else:
         model_type = getattr(config, "model_type", None)
         architectures = getattr(config, "architectures", None)
-        has_vision_config = hasattr(config, "vision_config")
-        has_img_processor = hasattr(config, "img_processor")
-        has_image_token_index = hasattr(config, "image_token_index")
-        has_image_token_id = hasattr(config, "image_token_id")
+        vision_config = getattr(config, "vision_config", None)
+        img_processor = getattr(config, "img_processor", None)
+        image_token_index = getattr(config, "image_token_index", None)
+        image_token_id = getattr(config, "image_token_id", None)
 
     if model_type in _AUDIO_ONLY_MODEL_TYPES:
         return False
 
-    # Explicit vision signals are definitive
-    if has_vision_config or has_img_processor or has_image_token_index or has_image_token_id:
+    # Explicit vision signals are definitive (must be non-None to count)
+    if any(v is not None for v in (vision_config, img_processor, image_token_index, image_token_id)):
         return True
 
     # ForVisionText2Text is a VLM-specific architecture suffix
@@ -731,11 +731,20 @@ def _classify_detection_error(exc: Exception) -> Optional[bool]:
             )
         except ImportError:
             RepositoryNotFoundError = GatedRepoError = None
-    if RepositoryNotFoundError is not None and isinstance(
-        exc, (RepositoryNotFoundError, GatedRepoError)
-    ):
-        return False
-    if isinstance(exc, (ValueError, json.JSONDecodeError)):
+    # EntryNotFoundError means config.json doesn't exist in the repo -- permanent
+    try:
+        from huggingface_hub.errors import EntryNotFoundError, RevisionNotFoundError
+    except ImportError:
+        try:
+            from huggingface_hub.utils import EntryNotFoundError, RevisionNotFoundError
+        except ImportError:
+            EntryNotFoundError = RevisionNotFoundError = None
+    permanent_types = [ValueError, json.JSONDecodeError]
+    if RepositoryNotFoundError is not None:
+        permanent_types.extend([RepositoryNotFoundError, GatedRepoError])
+    if EntryNotFoundError is not None:
+        permanent_types.extend([EntryNotFoundError, RevisionNotFoundError])
+    if isinstance(exc, tuple(permanent_types)):
         return False
     return None
 
