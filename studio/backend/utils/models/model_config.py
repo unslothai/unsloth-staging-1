@@ -481,7 +481,10 @@ def load_model_config(
     )
 
 
-# Known VLM model_type values.
+# Known VLM model_type values. Used as a fallback when explicit vision signals
+# (vision_config, img_processor, image_token_index) are not present in the config.
+# In practice, all these models DO have explicit vision signals in their real configs;
+# the model_type list provides a safety net for partial/mock configs.
 _VLM_MODEL_TYPES = {
     "phi3_v",
     "llava",
@@ -490,6 +493,20 @@ _VLM_MODEL_TYPES = {
     "internvl_chat",
     "cogvlm2",
     "minicpmv",
+    "gemma3",
+    "gemma4",
+    "qwen2_vl",
+    "qwen2_5_vl",
+    "qwen3_5",
+    "paligemma",
+    "pix2struct",
+    "video_llava",
+    "blip-2",
+    "blip_2",
+    "idefics2",
+    "idefics3",
+    "mllama",
+    "chameleon",
 }
 _AUDIO_ONLY_MODEL_TYPES = {"csm", "whisper"}
 
@@ -538,7 +555,10 @@ try:
             )
         if not is_vlm and model_type in {
             "phi3_v", "llava", "llava_next", "llava_onevision",
-            "internvl_chat", "cogvlm2", "minicpmv",
+            "internvl_chat", "cogvlm2", "minicpmv", "gemma3", "gemma4",
+            "qwen2_vl", "qwen2_5_vl", "qwen3_5", "paligemma",
+            "pix2struct", "video_llava", "blip-2", "blip_2",
+            "idefics2", "idefics3", "mllama", "chameleon",
         }:
             is_vlm = True
 
