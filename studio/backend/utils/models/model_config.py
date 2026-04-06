@@ -507,6 +507,8 @@ _VLM_MODEL_TYPES = {
     "idefics3",
     "mllama",
     "chameleon",
+    "xgenmm",
+    "qwen3_vl",
 }
 _AUDIO_ONLY_MODEL_TYPES = {"csm", "whisper"}
 
@@ -559,6 +561,7 @@ try:
             "qwen2_vl", "qwen2_5_vl", "qwen3_5", "paligemma",
             "pix2struct", "video_llava", "blip-2", "blip_2",
             "idefics2", "idefics3", "mllama", "chameleon",
+            "xgenmm", "qwen3_vl",
         }:
             is_vlm = True
 
@@ -677,7 +680,7 @@ def _load_model_config_metadata(
             config_path = Path(normalize_path(model_name)) / "config.json"
             if config_path.is_file():
                 return json.loads(config_path.read_text()), None
-            return None, FileNotFoundError(f"No config.json at {config_path}")
+            return None, None
 
         from huggingface_hub import hf_hub_download
 
@@ -722,7 +725,7 @@ def _classify_detection_error(exc: Exception) -> Optional[bool]:
         exc, (RepositoryNotFoundError, GatedRepoError)
     ):
         return False
-    if isinstance(exc, (ValueError, json.JSONDecodeError, FileNotFoundError)):
+    if isinstance(exc, (ValueError, json.JSONDecodeError)):
         return False
     return None
 
