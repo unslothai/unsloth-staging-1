@@ -513,6 +513,8 @@ _VLM_MODEL_TYPES = {
     "chameleon",
     "xgenmm",
     "smolvlm",
+    "molmo",
+    "fuyu",
 }
 _AUDIO_ONLY_MODEL_TYPES = {"csm", "whisper"}
 
@@ -567,7 +569,7 @@ try:
             "gemma4", "qwen2_vl", "qwen2_5_vl", "qwen3_5", "qwen3_vl",
             "qwen3_vl_moe", "paligemma", "pix2struct", "video_llava",
             "blip-2", "blip_2", "idefics2", "idefics3", "mllama",
-            "chameleon", "xgenmm", "smolvlm",
+            "chameleon", "xgenmm", "smolvlm", "molmo", "fuyu",
         }:
             is_vlm = True
 
