@@ -481,8 +481,7 @@ def load_model_config(
     )
 
 
-# VLM architecture suffixes and known VLM model_type values.
-_VLM_ARCH_SUFFIXES = ("ForConditionalGeneration", "ForVisionText2Text")
+# Known VLM model_type values.
 _VLM_MODEL_TYPES = {
     "phi3_v",
     "llava",
@@ -493,17 +492,6 @@ _VLM_MODEL_TYPES = {
     "minicpmv",
 }
 _AUDIO_ONLY_MODEL_TYPES = {"csm", "whisper"}
-
-# Seq2seq model types that use ForConditionalGeneration but are NOT vision models.
-_NON_VLM_CONDITIONAL_MODEL_TYPES = {
-    "bart",
-    "mbart",
-    "t5",
-    "mt5",
-    "pegasus",
-    "blenderbot",
-    "blenderbot-small",
-}
 
 # Pre-computed .venv_t5 path and backend dir for subprocess version switching.
 _VENV_T5_DIR = str(Path.home() / ".unsloth" / "studio" / ".venv_t5")
@@ -534,22 +522,20 @@ try:
 
     model_type = getattr(config, "model_type", None)
     audio_only_types = {"csm", "whisper"}
-    non_vlm_seq2seq_types = {"bart", "mbart", "t5", "mt5", "pegasus",
-                              "blenderbot", "blenderbot-small"}
 
     is_vlm = False
-    if model_type not in audio_only_types and model_type not in non_vlm_seq2seq_types:
-        if hasattr(config, "architectures"):
-            is_vlm = any(
-                x.endswith(("ForConditionalGeneration", "ForVisionText2Text"))
-                for x in config.architectures
-            )
-        if not is_vlm and hasattr(config, "vision_config"):
+    if model_type not in audio_only_types:
+        if hasattr(config, "vision_config"):
             is_vlm = True
         if not is_vlm and hasattr(config, "img_processor"):
             is_vlm = True
         if not is_vlm and hasattr(config, "image_token_index"):
             is_vlm = True
+        if not is_vlm and hasattr(config, "architectures"):
+            is_vlm = any(
+                x.endswith("ForVisionText2Text")
+                for x in config.architectures
+            )
         if not is_vlm and model_type in {
             "phi3_v", "llava", "llava_next", "llava_onevision",
             "internvl_chat", "cogvlm2", "minicpmv",
@@ -644,29 +630,34 @@ def _is_vlm_config(config: Any) -> bool:
         has_img_processor = hasattr(config, "img_processor")
         has_image_token_index = hasattr(config, "image_token_index")
 
-    if model_type in _AUDIO_ONLY_MODEL_TYPES or model_type in _NON_VLM_CONDITIONAL_MODEL_TYPES:
+    if model_type in _AUDIO_ONLY_MODEL_TYPES:
         return False
 
-    if architectures and any(x.endswith(_VLM_ARCH_SUFFIXES) for x in architectures):
+    # Explicit vision signals are definitive
+    if has_vision_config or has_img_processor or has_image_token_index:
         return True
 
-    return (
-        has_vision_config
-        or has_img_processor
-        or has_image_token_index
-        or model_type in _VLM_MODEL_TYPES
-    )
+    # ForVisionText2Text is a VLM-specific architecture suffix
+    if architectures and any(x.endswith("ForVisionText2Text") for x in architectures):
+        return True
+
+    return model_type in _VLM_MODEL_TYPES
 
 
 def _load_model_config_metadata(
     model_name: str, hf_token: Optional[str] = None
-) -> Optional[Dict[str, Any]]:
+) -> Tuple[Optional[Dict[str, Any]], Optional[Exception]]:
+    """Load raw config.json as a plain dict, bypassing AutoConfig.
+
+    Returns (config_dict, None) on success, or (None, exception) on failure.
+    The exception is returned so callers can classify permanent vs transient.
+    """
     try:
         if is_local_path(model_name):
             config_path = Path(normalize_path(model_name)) / "config.json"
             if config_path.is_file():
-                return json.loads(config_path.read_text())
-            return None
+                return json.loads(config_path.read_text()), None
+            return None, FileNotFoundError(f"No config.json at {config_path}")
 
         from huggingface_hub import hf_hub_download
 
@@ -684,10 +675,36 @@ def _load_model_config_metadata(
             filename = "config.json",
             **download_kwargs,
         )
-        return json.loads(Path(config_path).read_text())
+        return json.loads(Path(config_path).read_text()), None
     except Exception as exc:
         logger.warning("Could not load raw config metadata for %s: %s", model_name, exc)
-        return None
+        return None, exc
+
+
+def _classify_detection_error(exc: Exception) -> Optional[bool]:
+    """Classify a detection exception as permanent (False) or transient (None).
+
+    Permanent failures (model not found, gated, bad config) are safe to cache
+    as False. Transient failures (network, timeout) should not be cached so
+    they can be retried on the next call.
+    """
+    try:
+        from huggingface_hub.errors import RepositoryNotFoundError, GatedRepoError
+    except ImportError:
+        try:
+            from huggingface_hub.utils import (
+                RepositoryNotFoundError,
+                GatedRepoError,
+            )
+        except ImportError:
+            RepositoryNotFoundError = GatedRepoError = None
+    if RepositoryNotFoundError is not None and isinstance(
+        exc, (RepositoryNotFoundError, GatedRepoError)
+    ):
+        return False
+    if isinstance(exc, (ValueError, json.JSONDecodeError, FileNotFoundError)):
+        return False
+    return None
 
 
 def _token_fingerprint(token: Optional[str]) -> Optional[str]:
@@ -789,7 +806,9 @@ def _is_vision_model_uncached(
             return subprocess_result
 
         # Subprocess failed (transient) -- fall back to raw config.json metadata
-        config_data = _load_model_config_metadata(model_name, hf_token = hf_token)
+        config_data, metadata_error = _load_model_config_metadata(
+            model_name, hf_token = hf_token
+        )
         if config_data is not None:
             is_vlm = _is_vlm_config(config_data)
             if is_vlm:
@@ -801,6 +820,11 @@ def _is_vision_model_uncached(
                     config_data.get("architectures", []),
                 )
             return is_vlm
+
+        # Both subprocess and raw config failed -- classify the error.
+        # Permanent failures should be cached as False; transient as None.
+        if metadata_error is not None:
+            return _classify_detection_error(metadata_error)
         return None
 
     try:
@@ -808,25 +832,7 @@ def _is_vision_model_uncached(
         return _is_vlm_config(config)
     except Exception as e:
         logger.warning(f"Could not determine if {model_name} is vision model: {e}")
-        # Permanent failures (model not found, gated, bad config) should be
-        # cached as False. Transient failures (network, timeout) should not.
-        try:
-            from huggingface_hub.errors import RepositoryNotFoundError, GatedRepoError
-        except ImportError:
-            try:
-                from huggingface_hub.utils import (
-                    RepositoryNotFoundError,
-                    GatedRepoError,
-                )
-            except ImportError:
-                RepositoryNotFoundError = GatedRepoError = None
-        if RepositoryNotFoundError is not None and isinstance(
-            e, (RepositoryNotFoundError, GatedRepoError)
-        ):
-            return False
-        if isinstance(e, (ValueError, json.JSONDecodeError)):
-            return False
-        return None
+        return _classify_detection_error(e)
 
 
 VALID_AUDIO_TYPES = ("snac", "csm", "bicodec", "dac", "whisper", "audio_vlm")
