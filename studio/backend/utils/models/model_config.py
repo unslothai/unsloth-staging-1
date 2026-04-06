@@ -482,9 +482,10 @@ def load_model_config(
 
 
 # Known VLM model_type values. Used as a fallback when explicit vision signals
-# (vision_config, img_processor, image_token_index) are not present in the config.
-# In practice, all these models DO have explicit vision signals in their real configs;
-# the model_type list provides a safety net for partial/mock configs.
+# (vision_config, img_processor, image_token_index, image_token_id) are not
+# present in the config. In practice, all these models DO have explicit vision
+# signals in their real configs; the model_type list provides a safety net for
+# partial/mock configs.
 _VLM_MODEL_TYPES = {
     "phi3_v",
     "llava",
@@ -494,10 +495,13 @@ _VLM_MODEL_TYPES = {
     "cogvlm2",
     "minicpmv",
     "gemma3",
+    "gemma3n",
     "gemma4",
     "qwen2_vl",
     "qwen2_5_vl",
     "qwen3_5",
+    "qwen3_vl",
+    "qwen3_vl_moe",
     "paligemma",
     "pix2struct",
     "video_llava",
@@ -508,7 +512,7 @@ _VLM_MODEL_TYPES = {
     "mllama",
     "chameleon",
     "xgenmm",
-    "qwen3_vl",
+    "smolvlm",
 }
 _AUDIO_ONLY_MODEL_TYPES = {"csm", "whisper"}
 
@@ -550,6 +554,8 @@ try:
             is_vlm = True
         if not is_vlm and hasattr(config, "image_token_index"):
             is_vlm = True
+        if not is_vlm and hasattr(config, "image_token_id"):
+            is_vlm = True
         if not is_vlm and hasattr(config, "architectures"):
             is_vlm = any(
                 x.endswith("ForVisionText2Text")
@@ -557,11 +563,11 @@ try:
             )
         if not is_vlm and model_type in {
             "phi3_v", "llava", "llava_next", "llava_onevision",
-            "internvl_chat", "cogvlm2", "minicpmv", "gemma3", "gemma4",
-            "qwen2_vl", "qwen2_5_vl", "qwen3_5", "paligemma",
-            "pix2struct", "video_llava", "blip-2", "blip_2",
-            "idefics2", "idefics3", "mllama", "chameleon",
-            "xgenmm", "qwen3_vl",
+            "internvl_chat", "cogvlm2", "minicpmv", "gemma3", "gemma3n",
+            "gemma4", "qwen2_vl", "qwen2_5_vl", "qwen3_5", "qwen3_vl",
+            "qwen3_vl_moe", "paligemma", "pix2struct", "video_llava",
+            "blip-2", "blip_2", "idefics2", "idefics3", "mllama",
+            "chameleon", "xgenmm", "smolvlm",
         }:
             is_vlm = True
 
@@ -646,18 +652,20 @@ def _is_vlm_config(config: Any) -> bool:
         has_vision_config = "vision_config" in config
         has_img_processor = "img_processor" in config
         has_image_token_index = "image_token_index" in config
+        has_image_token_id = "image_token_id" in config
     else:
         model_type = getattr(config, "model_type", None)
         architectures = getattr(config, "architectures", None)
         has_vision_config = hasattr(config, "vision_config")
         has_img_processor = hasattr(config, "img_processor")
         has_image_token_index = hasattr(config, "image_token_index")
+        has_image_token_id = hasattr(config, "image_token_id")
 
     if model_type in _AUDIO_ONLY_MODEL_TYPES:
         return False
 
     # Explicit vision signals are definitive
-    if has_vision_config or has_img_processor or has_image_token_index:
+    if has_vision_config or has_img_processor or has_image_token_index or has_image_token_id:
         return True
 
     # ForVisionText2Text is a VLM-specific architecture suffix
