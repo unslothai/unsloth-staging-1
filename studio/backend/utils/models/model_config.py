@@ -26,7 +26,9 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import List, Tuple
+import hashlib
 import json
+import threading
 import yaml
 
 
@@ -490,7 +492,6 @@ _VLM_MODEL_TYPES = {
     "cogvlm2",
     "minicpmv",
 }
-_AUDIO_ONLY_MODEL_TYPES = {"csm", "whisper"}
 
 # Pre-computed .venv_t5 path and backend dir for subprocess version switching.
 _VENV_T5_DIR = str(Path.home() / ".unsloth" / "studio" / ".venv_t5")
@@ -555,6 +556,11 @@ def _is_vision_model_subprocess(
     Same pattern as training/inference workers: spawn a clean subprocess
     with .venv_t5/ prepended to sys.path so AutoConfig recognizes newer
     architectures (glm4_moe_lite, etc.).
+
+    Returns True/False for definitive results, or None for transient failures
+    (timeouts, subprocess errors) so callers can decide whether to cache
+    the result. Subprocess failures are treated as transient because they
+    can be caused by temporary HF/auth/network issues.
     """
     token_arg = hf_token or ""
 
@@ -611,59 +617,22 @@ def _is_vision_model_subprocess(
         return None
 
 
-def _is_vlm_config(config: Any) -> bool:
-    if isinstance(config, dict):
-        model_type = config.get("model_type")
-        architectures = config.get("architectures")
-        has_vision_config = "vision_config" in config
-        has_img_processor = "img_processor" in config
-        has_image_token_index = "image_token_index" in config
-    else:
-        model_type = getattr(config, "model_type", None)
-        architectures = getattr(config, "architectures", None)
-        has_vision_config = hasattr(config, "vision_config")
-        has_img_processor = hasattr(config, "img_processor")
-        has_image_token_index = hasattr(config, "image_token_index")
+def _token_fingerprint(token: Optional[str]) -> Optional[str]:
+    """Return a SHA256 digest of the token for use as a cache key.
 
-    if model_type in _AUDIO_ONLY_MODEL_TYPES:
-        return False
-
-    if architectures:
-        if any(x.endswith(_VLM_ARCH_SUFFIXES) for x in architectures):
-            return True
-
-    if (
-        has_vision_config or has_img_processor or has_image_token_index
-    ) or model_type in _VLM_MODEL_TYPES:
-        return True
-    return False
-
-
-def _load_model_config_metadata(
-    model_name: str, hf_token: Optional[str] = None
-) -> Optional[dict[str, Any]]:
-    try:
-        if is_local_path(model_name):
-            config_path = Path(normalize_path(model_name)) / "config.json"
-            if config_path.is_file():
-                return json.loads(config_path.read_text())
-            return None
-
-        from huggingface_hub import hf_hub_download
-
-        download_kwargs: dict[str, Any] = {}
-        if hf_token:
-            download_kwargs["token"] = hf_token
-
-        config_path = hf_hub_download(
-            repo_id = model_name,
-            filename = "config.json",
-            **download_kwargs,
-        )
-        return json.loads(Path(config_path).read_text())
-    except Exception as exc:
-        logger.warning("Could not load raw config metadata for %s: %s", model_name, exc)
+    Avoids storing the raw bearer token in process memory as a dict key.
+    """
+    if token is None:
         return None
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+# Cache vision detection results per session to avoid repeated subprocess spawns.
+# Keyed by (normalized_model_name, token_fingerprint) to handle gated models correctly.
+# Only definitive results (True/False from successful detection) are cached;
+# transient failures (network errors, timeouts) are NOT cached so they can be retried.
+_vision_detection_cache: Dict[Tuple[str, Optional[str]], bool] = {}
+_vision_cache_lock = threading.Lock()
 
 
 def is_vision_model(model_name: str, hf_token: Optional[str] = None) -> bool:
@@ -672,62 +641,143 @@ def is_vision_model(model_name: str, hf_token: Optional[str] = None) -> bool:
     Works for fine-tuned models since they inherit the base architecture.
 
     For models that require transformers 5.x (e.g. GLM-4.7-Flash), the check
-    runs in a subprocess with .venv_t5/ activated — same pattern as the
+    runs in a subprocess with .venv_t5/ activated -- same pattern as the
     training and inference workers.
+
+    Results are cached per (model_name, token_fingerprint) for the lifetime of
+    the process to avoid repeated subprocess spawns and HuggingFace API calls.
+    Transient failures are not cached so they can be retried on the next call.
 
     Args:
         model_name: Model identifier (HF repo or local path)
         hf_token: Optional HF token for accessing gated/private models
+    """
+    # Normalize model name for cache key to avoid duplicate entries for
+    # different casings of the same HF repo (e.g. "Org/Model" vs "org/model").
+    try:
+        if is_local_path(model_name):
+            resolved_name = normalize_path(model_name)
+        else:
+            resolved_name = resolve_cached_repo_id_case(model_name)
+    except Exception as exc:
+        logger.debug(
+            "Could not normalize model name '%s' for cache key: %s",
+            model_name,
+            exc,
+        )
+        resolved_name = model_name
+    cache_key = (resolved_name, _token_fingerprint(hf_token))
+
+    # Lock-free fast path for cache hits. Uses a sentinel to distinguish
+    # "key not found" from "value is False" in a single atomic dict.get() call.
+    _MISS = object()
+    cached = _vision_detection_cache.get(cache_key, _MISS)
+    if cached is not _MISS:
+        return cached
+
+    # Compute outside the lock to avoid serializing long-running detection
+    # (subprocess spawns with 60s timeout, HF API calls) across all models.
+    # The tradeoff: two concurrent calls for the same uncached model may
+    # both run detection, but they produce the same result and the second
+    # write is a benign no-op.
+    result = _is_vision_model_uncached(resolved_name, hf_token)
+    # Only cache definitive results; None means a transient failure occurred
+    # and we should retry on the next call instead of locking in a wrong answer.
+    if result is not None:
+        with _vision_cache_lock:
+            _vision_detection_cache[cache_key] = result
+        return result
+    return False
+
+
+def _is_vision_model_uncached(
+    model_name: str, hf_token: Optional[str] = None
+) -> Optional[bool]:
+    """Uncached vision model detection -- called by is_vision_model().
+
+    Returns True/False for definitive results, or None when detection failed
+    due to a transient error (network, timeout, subprocess failure) so the
+    caller knows not to cache the result.
+
+    Do not call directly; use is_vision_model() instead.
     """
     # Models that need transformers 5.x must be checked in a subprocess
     # because AutoConfig in the main process (transformers 4.57.x) doesn't
     # recognize their architectures.
     from utils.transformers_version import needs_transformers_5
 
-    needs_t5 = needs_transformers_5(model_name)
+    if needs_transformers_5(model_name):
+        logger.info(
+            "Model '%s' needs transformers 5.x -- checking vision via subprocess",
+            model_name,
+        )
+        return _is_vision_model_subprocess(model_name, hf_token = hf_token)
 
     try:
         config = load_model_config(model_name, use_auth = True, token = hf_token)
-        if _is_vlm_config(config):
-            model_type = getattr(config, "model_type", None)
-            architectures = getattr(config, "architectures", [])
-            logger.info(
-                "Model %s detected as VLM in-process: model_type=%s architectures=%s",
-                model_name,
-                model_type,
-                architectures,
-            )
-            return True
-        if not needs_t5:
+
+        # Exclude audio-only models that share ForConditionalGeneration suffix
+        # (e.g. CsmForConditionalGeneration, WhisperForConditionalGeneration)
+        _audio_only_model_types = {"csm", "whisper"}
+        model_type = getattr(config, "model_type", None)
+        if model_type in _audio_only_model_types:
             return False
 
-    except Exception as e:
-        logger.warning(
-            f"Could not determine if {model_name} is vision model in-process: {e}"
-        )
+        # Check 1: Architecture class name patterns
+        if hasattr(config, "architectures"):
+            is_vlm = any(x.endswith(_VLM_ARCH_SUFFIXES) for x in config.architectures)
+            if is_vlm:
+                logger.info(
+                    f"Model {model_name} detected as VLM: architecture {config.architectures}"
+                )
+                return True
 
-    if needs_t5:
-        logger.info(
-            "Model '%s' needs transformers 5.x — checking vision via subprocess",
-            model_name,
-        )
-        subprocess_result = _is_vision_model_subprocess(model_name, hf_token = hf_token)
-        if subprocess_result is not None:
-            return subprocess_result
-
-    config_data = _load_model_config_metadata(model_name, hf_token = hf_token)
-    if config_data is not None:
-        if _is_vlm_config(config_data):
-            logger.info(
-                "Model %s detected as VLM from raw config metadata: model_type=%s architectures=%s",
-                model_name,
-                config_data.get("model_type"),
-                config_data.get("architectures", []),
-            )
+        # Check 2: Has vision_config (most VLMs: LLaVA, Gemma-3, Qwen2-VL, etc.)
+        if hasattr(config, "vision_config"):
+            logger.info(f"Model {model_name} detected as VLM: has vision_config")
             return True
+
+        # Check 3: Has img_processor (Phi-3.5 Vision uses this instead of vision_config)
+        if hasattr(config, "img_processor"):
+            logger.info(f"Model {model_name} detected as VLM: has img_processor")
+            return True
+
+        # Check 4: Has image_token_index (common in VLMs for image placeholder tokens)
+        if hasattr(config, "image_token_index"):
+            logger.info(f"Model {model_name} detected as VLM: has image_token_index")
+            return True
+
+        # Check 5: Known VLM model_type values that may not match above checks
+        if hasattr(config, "model_type"):
+            if config.model_type in _VLM_MODEL_TYPES:
+                logger.info(
+                    f"Model {model_name} detected as VLM: model_type={config.model_type}"
+                )
+                return True
+
         return False
 
-    return False
+    except Exception as e:
+        logger.warning(f"Could not determine if {model_name} is vision model: {e}")
+        # Permanent failures (model not found, gated, bad config) should be
+        # cached as False. Transient failures (network, timeout) should not.
+        try:
+            from huggingface_hub.errors import RepositoryNotFoundError, GatedRepoError
+        except ImportError:
+            try:
+                from huggingface_hub.utils import (
+                    RepositoryNotFoundError,
+                    GatedRepoError,
+                )
+            except ImportError:
+                RepositoryNotFoundError = GatedRepoError = None
+        if RepositoryNotFoundError is not None and isinstance(
+            e, (RepositoryNotFoundError, GatedRepoError)
+        ):
+            return False
+        if isinstance(e, (ValueError, json.JSONDecodeError)):
+            return False
+        return None
 
 
 VALID_AUDIO_TYPES = ("snac", "csm", "bicodec", "dac", "whisper", "audio_vlm")
