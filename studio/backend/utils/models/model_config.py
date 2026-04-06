@@ -519,23 +519,30 @@ try:
         kwargs["token"] = token
     config = AutoConfig.from_pretrained(model_name, **kwargs)
 
-    is_vlm = False
-    if hasattr(config, "architectures"):
-        is_vlm = any(
-            x.endswith(("ForConditionalGeneration", "ForVisionText2Text"))
-            for x in config.architectures
-        )
-    if not is_vlm and hasattr(config, "vision_config"):
-        is_vlm = True
-    if not is_vlm and hasattr(config, "img_processor"):
-        is_vlm = True
-    if not is_vlm and hasattr(config, "image_token_index"):
-        is_vlm = True
-    if not is_vlm and hasattr(config, "model_type"):
-        vlm_types = {"phi3_v","llava","llava_next","llava_onevision",
-                      "internvl_chat","cogvlm2","minicpmv"}
-        if config.model_type in vlm_types:
+    # Exclude audio-only models that share ForConditionalGeneration suffix
+    audio_only_types = {"csm", "whisper"}
+    model_type = getattr(config, "model_type", None)
+    if model_type in audio_only_types:
+        is_vlm = False
+    else:
+        is_vlm = False
+        archs = getattr(config, "architectures", None)
+        if archs:
+            is_vlm = any(
+                x.endswith(("ForConditionalGeneration", "ForVisionText2Text"))
+                for x in archs
+            )
+        if not is_vlm and hasattr(config, "vision_config"):
             is_vlm = True
+        if not is_vlm and hasattr(config, "img_processor"):
+            is_vlm = True
+        if not is_vlm and hasattr(config, "image_token_index"):
+            is_vlm = True
+        if not is_vlm and model_type:
+            vlm_types = {"phi3_v","llava","llava_next","llava_onevision",
+                          "internvl_chat","cogvlm2","minicpmv"}
+            if model_type in vlm_types:
+                is_vlm = True
 
     model_type = getattr(config, "model_type", "unknown")
     archs = getattr(config, "architectures", [])
@@ -611,7 +618,8 @@ def _is_vision_model_subprocess(
         return None
 
 
-def _is_vlm_config(config: Any) -> bool:
+def _is_vlm_config(config, allow_arch_suffix = True):
+    # type: (Any, bool) -> bool
     if isinstance(config, dict):
         model_type = config.get("model_type")
         architectures = config.get("architectures")
@@ -628,30 +636,29 @@ def _is_vlm_config(config: Any) -> bool:
     if model_type in _AUDIO_ONLY_MODEL_TYPES:
         return False
 
-    if architectures:
+    if has_vision_config or has_img_processor or has_image_token_index:
+        return True
+    if model_type in _VLM_MODEL_TYPES:
+        return True
+    if allow_arch_suffix and architectures:
         if any(x.endswith(_VLM_ARCH_SUFFIXES) for x in architectures):
             return True
-
-    if (
-        has_vision_config or has_img_processor or has_image_token_index
-    ) or model_type in _VLM_MODEL_TYPES:
-        return True
     return False
 
 
 def _load_model_config_metadata(
     model_name: str, hf_token: Optional[str] = None
-) -> Optional[dict[str, Any]]:
+) -> Optional[Dict[str, Any]]:
     try:
         if is_local_path(model_name):
-            config_path = Path(normalize_path(model_name)) / "config.json"
+            config_path = Path(normalize_path(model_name)).expanduser() / "config.json"
             if config_path.is_file():
-                return json.loads(config_path.read_text())
+                return json.loads(config_path.read_text(encoding = "utf-8"))
             return None
 
         from huggingface_hub import hf_hub_download
 
-        download_kwargs: dict[str, Any] = {}
+        download_kwargs = {}  # type: Dict[str, Any]
         if hf_token:
             download_kwargs["token"] = hf_token
 
@@ -660,7 +667,7 @@ def _load_model_config_metadata(
             filename = "config.json",
             **download_kwargs,
         )
-        return json.loads(Path(config_path).read_text())
+        return json.loads(Path(config_path).read_text(encoding = "utf-8"))
     except Exception as exc:
         logger.warning("Could not load raw config metadata for %s: %s", model_name, exc)
         return None
@@ -686,47 +693,48 @@ def is_vision_model(model_name: str, hf_token: Optional[str] = None) -> bool:
 
     needs_t5 = needs_transformers_5(model_name)
 
-    try:
-        config = load_model_config(model_name, use_auth = True, token = hf_token)
-        if _is_vlm_config(config):
-            model_type = getattr(config, "model_type", None)
-            architectures = getattr(config, "architectures", [])
-            logger.info(
-                "Model %s detected as VLM in-process: model_type=%s architectures=%s",
-                model_name,
-                model_type,
-                architectures,
-            )
-            return True
-        if not needs_t5:
-            return False
-
-    except Exception as e:
-        logger.warning(
-            f"Could not determine if {model_name} is vision model in-process: {e}"
-        )
-
+    # For transformers-5 models, keep them out of the main process to avoid
+    # running trust_remote_code in-process.  Try subprocess first, then fall
+    # back to raw config.json metadata.
     if needs_t5:
         logger.info(
-            "Model '%s' needs transformers 5.x — checking vision via subprocess",
+            "Model '%s' needs transformers 5.x -- checking vision via subprocess",
             model_name,
         )
         subprocess_result = _is_vision_model_subprocess(model_name, hf_token = hf_token)
         if subprocess_result is not None:
             return subprocess_result
 
-    config_data = _load_model_config_metadata(model_name, hf_token = hf_token)
-    if config_data is not None:
-        if _is_vlm_config(config_data):
-            logger.info(
-                "Model %s detected as VLM from raw config metadata: model_type=%s architectures=%s",
-                model_name,
-                config_data.get("model_type"),
-                config_data.get("architectures", []),
-            )
-            return True
+        # Subprocess failed or timed out -- fall back to raw config.json
+        config_data = _load_model_config_metadata(model_name, hf_token = hf_token)
+        if config_data is not None:
+            if _is_vlm_config(config_data, allow_arch_suffix = False):
+                logger.info(
+                    "Model %s detected as VLM from raw config metadata: "
+                    "model_type=%s architectures=%s",
+                    model_name,
+                    config_data.get("model_type"),
+                    config_data.get("architectures", []),
+                )
+                return True
+            return False
         return False
 
+    # Non-t5 models: check in-process via AutoConfig
+    try:
+        config = load_model_config(model_name, use_auth = True, token = hf_token)
+        return _is_vlm_config(config)
+    except Exception as e:
+        logger.warning(
+            f"Could not determine if {model_name} is vision model in-process: {e}"
+        )
+
+    # In-process load failed for a non-t5 model; try raw config.json as
+    # a last resort (e.g. AutoConfig cannot parse the config but the JSON
+    # is still valid).
+    config_data = _load_model_config_metadata(model_name, hf_token = hf_token)
+    if config_data is not None:
+        return _is_vlm_config(config_data, allow_arch_suffix = False)
     return False
 
 
