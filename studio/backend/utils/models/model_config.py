@@ -632,7 +632,9 @@ def _is_vlm_config(config: Any) -> bool:
         if any(x.endswith(_VLM_ARCH_SUFFIXES) for x in architectures):
             return True
 
-    if (has_vision_config or has_img_processor or has_image_token_index) or model_type in _VLM_MODEL_TYPES:
+    if (
+        has_vision_config or has_img_processor or has_image_token_index
+    ) or model_type in _VLM_MODEL_TYPES:
         return True
     return False
 
@@ -700,7 +702,9 @@ def is_vision_model(model_name: str, hf_token: Optional[str] = None) -> bool:
             return False
 
     except Exception as e:
-        logger.warning(f"Could not determine if {model_name} is vision model in-process: {e}")
+        logger.warning(
+            f"Could not determine if {model_name} is vision model in-process: {e}"
+        )
 
     if needs_t5:
         logger.info(
