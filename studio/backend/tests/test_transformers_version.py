@@ -228,11 +228,14 @@ class TestVisionModelDetection:
             ),
             patch(
                 "utils.models.model_config._load_model_config_metadata",
-                return_value = {
-                    "model_type": "qwen3_5",
-                    "architectures": ["Qwen3_5ForConditionalGeneration"],
-                    "vision_config": {},
-                },
+                return_value = (
+                    {
+                        "model_type": "qwen3_5",
+                        "architectures": ["Qwen3_5ForConditionalGeneration"],
+                        "vision_config": {},
+                    },
+                    None,
+                ),
             ),
         ):
             assert model_config.is_vision_model("unsloth/Qwen3.5-4B") is True
