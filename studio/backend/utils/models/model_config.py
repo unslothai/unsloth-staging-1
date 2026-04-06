@@ -637,7 +637,10 @@ def _is_vlm_config(config):
         return False
 
     if architectures:
-        if any(x.endswith(_VLM_ARCH_SUFFIXES) for x in architectures):
+        if any(
+            isinstance(x, str) and x.endswith(_VLM_ARCH_SUFFIXES)
+            for x in architectures
+        ):
             return True
 
     if has_vision_config or has_img_processor or has_image_token_index:
