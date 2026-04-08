@@ -1643,6 +1643,8 @@ class InferenceBackend:
             + "<|text_end|>\n<|audio_start|><|global_features_start|>\n"
         )
         with torch.inference_mode():
+            import contextlib
+
             # Derive the autocast device from the loaded model, not from the
             # global backend: a CPU-fallback DAC on an XPU/CUDA host must not
             # open a GPU autocast context around CPU tensors.
@@ -1653,9 +1655,17 @@ class InferenceBackend:
             )
             # Clamp to autocast-supported backends so exotic devices
             # (e.g. "meta" during accelerate offloaded loading) do not raise.
-            if device_type not in ("cuda", "xpu", "cpu"):
+            # MPS is autocast-supported since torch 2.3, keep it in the set.
+            if device_type not in ("cuda", "xpu", "mps", "cpu"):
                 device_type = "cpu"
-            with torch.amp.autocast(device_type, dtype = model.dtype):
+            # CPU autocast only accepts bfloat16/float16. For a float32 CPU
+            # model, skip autocast entirely to avoid raising before generate.
+            cpu_autocast_supported = model.dtype in (torch.bfloat16, torch.float16)
+            if device_type == "cpu" and not cpu_autocast_supported:
+                autocast_ctx = contextlib.nullcontext()
+            else:
+                autocast_ctx = torch.amp.autocast(device_type, dtype = model.dtype)
+            with autocast_ctx:
                 inputs = tokenizer([prompt], return_tensors = "pt").to(model.device)
                 generated = model.generate(
                     **inputs,

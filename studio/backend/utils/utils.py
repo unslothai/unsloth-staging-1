@@ -103,6 +103,8 @@ def format_error_message(error: Exception, model_name: str) -> str:
     if (
         "out of memory" in error_str
         or "out of device memory" in error_str
+        or "out_of_device_memory" in error_str  # ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY
+        or "out_of_host_memory" in error_str  # ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY
         or "not enough memory" in error_str
         or "cannot allocate memory" in error_str
         or ("mlx" in error_str and ("memory" in error_str or "allocate" in error_str))

@@ -393,12 +393,13 @@ def _torch_get_per_device_info(device_indices: list[int]) -> list[Dict[str, Any]
 
 
 def _parse_ze_mask_roots(mask: str) -> list[int]:
-    """Parse a ``ZE_AFFINITY_MASK`` value into an ordered list of unique root device IDs.
+    """Parse a ``ZE_AFFINITY_MASK`` value into an ordered list of root device IDs.
 
-    Accepts subdevice syntax such as ``0.0,0.1`` which collapses to ``[0]``.
-    Returns an empty list if the mask is empty or contains no parseable digits.
-    Insertion order is preserved so callers can map logical ordinals back to
-    physical root IDs via the returned list.
+    Returns one root ID per mask token, preserving order and duplicates so
+    that logical ordinals map 1-to-1 back to physical root IDs. For example
+    ``"0.0,0.1"`` yields ``[0, 0]`` (two logical devices, both under root
+    GPU 0) and ``"2.0,0.1,0.2"`` yields ``[2, 0, 0]``. Returns an empty
+    list if the mask is empty or contains no parseable digits.
     """
     roots: list[int] = []
     if not mask:
@@ -409,9 +410,7 @@ def _parse_ze_mask_roots(mask: str) -> list[int]:
             continue
         root = token.split(".", 1)[0]
         if root.isdigit():
-            root_id = int(root)
-            if root_id not in roots:
-                roots.append(root_id)
+            roots.append(int(root))
     return roots
 
 
@@ -692,20 +691,40 @@ def _get_parent_visible_gpu_spec() -> Dict[str, Any]:
                 "supports_explicit_gpu_ids": True,
             }
 
-        roots = _parse_ze_mask_roots(xpu_mask)
-        if not roots:
+        # Subdevice syntax (e.g. "0.0,0.1") expands a single root GPU into
+        # multiple logical devices. Explicit root-ID selection is not
+        # meaningful for subdevice masks, so surface them as unsupported.
+        has_subdevice = any(
+            "." in token.strip() for token in xpu_mask.split(",") if token.strip()
+        )
+
+        roots_with_dupes = _parse_ze_mask_roots(xpu_mask)
+        if not roots_with_dupes:
             # Non-digit wildcard (e.g. "*") or unparseable mask: treat the
             # same as "all physical XPUs visible" but disable explicit ids
             # since we cannot map logical ordinals to root IDs.
             return {
                 "raw": xpu_mask,
-                "numeric_ids": None,
+                "numeric_ids": list(range(get_physical_gpu_count())),
+                "supports_explicit_gpu_ids": False,
+            }
+
+        if has_subdevice:
+            # Dedup for display: multiple subdevice entries under the same
+            # root collapse to that root ID.
+            unique_roots: list[int] = []
+            for rid in roots_with_dupes:
+                if rid not in unique_roots:
+                    unique_roots.append(rid)
+            return {
+                "raw": xpu_mask,
+                "numeric_ids": unique_roots,
                 "supports_explicit_gpu_ids": False,
             }
 
         return {
             "raw": xpu_mask,
-            "numeric_ids": roots,
+            "numeric_ids": roots_with_dupes,
             "supports_explicit_gpu_ids": True,
         }
 
@@ -761,11 +780,16 @@ def resolve_requested_gpu_ids(gpu_ids: Optional[list[int]]) -> list[int]:
         return parent_visible_ids
 
     if not parent_visible_spec["supports_explicit_gpu_ids"]:
+        env_var_name = (
+            "ZE_AFFINITY_MASK"
+            if get_device() == DeviceType.XPU
+            else "CUDA_VISIBLE_DEVICES"
+        )
         raise ValueError(
             f"Invalid gpu_ids {requested_ids}: explicit physical GPU IDs are "
-            f"unsupported when CUDA_VISIBLE_DEVICES uses UUID/MIG entries "
-            f"({parent_visible_spec['raw']!r}). Omit gpu_ids to use the "
-            "parent-visible devices."
+            f"unsupported when {env_var_name} uses non-numeric or subdevice "
+            f"entries ({parent_visible_spec['raw']!r}). Omit gpu_ids to use "
+            "the parent-visible devices."
         )
 
     if len(set(requested_ids)) != len(requested_ids):
@@ -1244,10 +1268,10 @@ def prepare_gpu_selection(
     in the worker subprocess which narrows ``CUDA_VISIBLE_DEVICES`` before any
     torch/CUDA initialisation.
     """
-    if gpu_ids and get_device() != DeviceType.CUDA:
+    if gpu_ids and get_device() not in (DeviceType.CUDA, DeviceType.XPU):
         raise ValueError(
-            f"gpu_ids {list(gpu_ids)} is only supported on CUDA devices, "
-            f"but the current backend is '{get_device().value}'."
+            f"gpu_ids {list(gpu_ids)} is only supported on CUDA and Intel XPU "
+            f"devices, but the current backend is '{get_device().value}'."
         )
 
     if gpu_ids:
