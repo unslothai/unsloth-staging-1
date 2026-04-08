@@ -700,12 +700,14 @@ def _get_parent_visible_gpu_spec() -> Dict[str, Any]:
 
         roots_with_dupes = _parse_ze_mask_roots(xpu_mask)
         if not roots_with_dupes:
-            # Non-digit wildcard (e.g. "*") or unparseable mask: treat the
-            # same as "all physical XPUs visible" but disable explicit ids
-            # since we cannot map logical ordinals to root IDs.
+            # Non-digit wildcard (e.g. "*") or unparseable mask: we cannot map
+            # logical ordinals to physical root IDs. Mirror the CUDA UUID/MIG
+            # path by returning numeric_ids=None + supports_explicit_gpu_ids
+            # False, so get_device_map() falls back to its multi-visible
+            # heuristic and explicit ids are rejected.
             return {
                 "raw": xpu_mask,
-                "numeric_ids": list(range(get_physical_gpu_count())),
+                "numeric_ids": None,
                 "supports_explicit_gpu_ids": False,
             }
 
