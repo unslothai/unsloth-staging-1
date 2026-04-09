@@ -1513,37 +1513,41 @@ def _allowed_model_path_roots() -> List[Path]:
 def _canonicalize_model_path(path_str: str) -> Optional[Path]:
     """Resolve ``path_str`` and verify it lives under a Studio-managed root.
 
-    Path sanitizer for CodeQL ``py/path-injection``. The returned ``Path``
-    is the canonical (``resolve()``'d, symlink-expanded) form, guaranteed
-    to be a descendant of one of the roots in :func:`_allowed_model_path_roots`.
+    Path sanitizer for CodeQL ``py/path-injection``. Uses string-level
+    ``os.path.realpath`` + ``startswith`` against each allowed root: this
+    is the sanitizer pattern CodeQL's Python path-injection query
+    recognizes. A ``pathlib.Path`` is only constructed at the end, from
+    an already-validated string — so the tainted data is never passed to
+    ``Path(...)`` before validation.
 
     Returns ``None`` when:
-      * ``path_str`` is empty or falsy
-      * ``resolve()`` raises ``OSError`` / ``RuntimeError`` (bad symlink loop)
-      * the canonical path is not under any allowed root
+      * ``path_str`` is empty, falsy, or not a string
+      * realpath raises ``OSError`` / ``RuntimeError`` (bad symlink loop)
+      * the canonical path is not a descendant of any allowed root
 
     Callers should treat ``None`` the same as "path not found" — existing
     code paths already handle that case.
     """
-    if not path_str:
+    if not path_str or not isinstance(path_str, str):
         return None
     try:
-        resolved = Path(path_str).expanduser().resolve()
-    except (OSError, RuntimeError):
+        # ``os.path.realpath`` resolves ``..``, symlinks, and relative
+        # segments, returning a canonical absolute string. Combined with
+        # the allowlist check below it bounds the accessible filesystem
+        # to Studio-managed roots.
+        resolved_str = os.path.realpath(os.path.expanduser(path_str))
+    except (OSError, RuntimeError, TypeError, ValueError):
         return None
 
-    resolved_str = str(resolved)
     for root in _allowed_model_path_roots():
         try:
-            root_resolved = root.expanduser().resolve()
-        except (OSError, RuntimeError):
+            root_str = os.path.realpath(os.path.expanduser(str(root)))
+        except (OSError, RuntimeError, TypeError, ValueError):
             continue
-        root_str = str(root_resolved)
-        # Explicit string-prefix check — recognized by CodeQL's
-        # path-injection sanitizer detection. ``is_relative_to`` is also
-        # correct but not always picked up by the dataflow analysis.
+        # Explicit string-prefix check against a canonicalized root.
+        # CodeQL recognizes this pattern as a path-injection sanitizer.
         if resolved_str == root_str or resolved_str.startswith(root_str + os.sep):
-            return resolved
+            return Path(resolved_str)
 
     logger.warning(
         "Rejected model path outside Studio roots: %s (resolved: %s)",
