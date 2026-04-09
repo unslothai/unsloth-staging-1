@@ -1804,11 +1804,34 @@ def get_base_model_from_checkpoint(checkpoint_path: str) -> Optional[str]:
     try:
         # Sanitize the caller-supplied path against Studio-managed roots to
         # block path-traversal through ``POST /export/load-checkpoint`` and
-        # related HTTP entry points. All subsequent filesystem access uses
-        # the canonical path, not the raw input string.
-        checkpoint_path_obj = _canonicalize_model_path(checkpoint_path)
-        if checkpoint_path_obj is None:
+        # related HTTP entry points. The sanitizer is inlined here rather
+        # than delegated to a helper so CodeQL's intraprocedural
+        # path-injection sanitizer detection recognizes the
+        # ``os.path.commonpath`` equality check as a barrier on the flow
+        # into the downstream filesystem sinks below.
+        if not checkpoint_path or not isinstance(checkpoint_path, str):
             return None
+        try:
+            _resolved_str = os.path.realpath(os.path.expanduser(checkpoint_path))
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None
+        _allowed = False
+        for _root in _allowed_model_path_roots():
+            try:
+                _root_str = os.path.realpath(os.path.expanduser(str(_root)))
+                if os.path.commonpath([_resolved_str, _root_str]) == _root_str:
+                    _allowed = True
+                    break
+            except (OSError, ValueError):
+                continue
+        if not _allowed:
+            logger.warning(
+                "Rejected checkpoint_path outside Studio roots: %s (resolved: %s)",
+                checkpoint_path,
+                _resolved_str,
+            )
+            return None
+        checkpoint_path_obj = Path(_resolved_str)
 
         adapter_config_path = checkpoint_path_obj / "adapter_config.json"
         if adapter_config_path.exists():
@@ -1898,13 +1921,49 @@ def get_base_model_from_lora(lora_path: str) -> Optional[str]:
     try:
         # Sanitize the caller-supplied path against Studio-managed roots to
         # block path-traversal through ``GET /loras/{lora_path}/base-model``
-        # and related HTTP entry points. All subsequent filesystem access
-        # uses the canonical path, not the raw input string.
-        lora_path_obj = _canonicalize_model_path(lora_path)
-        if lora_path_obj is None:
+        # and related HTTP entry points. The sanitizer and all filesystem
+        # sinks are inlined into this function rather than delegated to
+        # ``_looks_like_lora_adapter``, so CodeQL's intraprocedural
+        # path-injection sanitizer detection can recognize the
+        # ``os.path.commonpath`` equality check as a barrier.
+        if not lora_path or not isinstance(lora_path, str):
             return None
+        try:
+            _resolved_str = os.path.realpath(os.path.expanduser(lora_path))
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None
+        _allowed = False
+        for _root in _allowed_model_path_roots():
+            try:
+                _root_str = os.path.realpath(os.path.expanduser(str(_root)))
+                if os.path.commonpath([_resolved_str, _root_str]) == _root_str:
+                    _allowed = True
+                    break
+            except (OSError, ValueError):
+                continue
+        if not _allowed:
+            logger.warning(
+                "Rejected lora_path outside Studio roots: %s (resolved: %s)",
+                lora_path,
+                _resolved_str,
+            )
+            return None
+        # ``_resolved_str`` has passed the commonpath allowlist check;
+        # CodeQL treats the subsequent Path construction as sanitized.
+        lora_path_obj = Path(_resolved_str)
 
-        if not _looks_like_lora_adapter(lora_path_obj):
+        # Inlined ``_looks_like_lora_adapter`` body. The helper is still
+        # used by the internal ``_detect_training_output_type`` caller
+        # (fed by ``scan_trained_models`` iterdir()) which is not reachable
+        # from user input.
+        if not lora_path_obj.is_dir():
+            return None
+        _has_adapter_marker = (
+            (lora_path_obj / "adapter_config.json").exists()
+            or any(lora_path_obj.glob("adapter_model*.safetensors"))
+            or any(lora_path_obj.glob("adapter_model*.bin"))
+        )
+        if not _has_adapter_marker:
             return None
 
         # Try adapter_config.json first
