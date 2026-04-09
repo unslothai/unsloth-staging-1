@@ -38,12 +38,17 @@ def test_scan_trained_models_includes_lora_and_full_finetune_outputs(tmp_path: P
     )
     (lora_dir / "adapter_model.safetensors").write_bytes(b"")
 
+    # Merged/full-finetune fixtures must include a tokenizer file so
+    # _detect_training_output_type classifies them as "merged". The scan
+    # now deliberately skips runs in the finalize window where the
+    # tokenizer has not been written yet.
     full_dir = tmp_path / "unsloth_SmolLM-135M_full_1775412609"
     full_dir.mkdir()
     (full_dir / "config.json").write_text(
         json.dumps({"_name_or_path": "HuggingFaceTB/SmolLM-135M"})
     )
     (full_dir / "model.safetensors").write_bytes(b"")
+    (full_dir / "tokenizer_config.json").write_text("{}")
 
     found = {
         name: (path, model_type)
@@ -52,6 +57,26 @@ def test_scan_trained_models_includes_lora_and_full_finetune_outputs(tmp_path: P
 
     assert found[lora_dir.name] == (str(lora_dir), "lora")
     assert found[full_dir.name] == (str(full_dir), "merged")
+
+
+def test_scan_trained_models_excludes_finalize_window_runs_without_tokenizer(
+    tmp_path: Path,
+):
+    """A merged run with config + weights but no tokenizer must not be
+    surfaced. Studio writes ``save_model()`` before
+    ``tokenizer.save_pretrained(output_dir)``, so scanning during that
+    finalize window would otherwise list a checkpoint that still cannot
+    be loaded."""
+    partial = tmp_path / "unsloth_SmolLM-135M_full_1775412610"
+    partial.mkdir()
+    (partial / "config.json").write_text(
+        json.dumps({"_name_or_path": "HuggingFaceTB/SmolLM-135M"})
+    )
+    (partial / "model.safetensors").write_bytes(b"")
+    # Deliberately no tokenizer file here.
+
+    found = scan_trained_models(str(tmp_path))
+    assert all(name != partial.name for name, _, _ in found)
 
 
 def test_get_base_model_from_checkpoint_falls_back_to_full_finetune_config(
@@ -106,12 +131,16 @@ def test_scan_trained_loras_backward_compatible_2_tuples(tmp_path: Path):
     )
     (lora_dir / "adapter_model.safetensors").write_bytes(b"")
 
+    # Fully-formed merged dir (with tokenizer) so the "merged dir
+    # excluded from backward-compat wrapper" assertion below tests the
+    # filter, not the finalize-window guard.
     merged_dir = tmp_path / "unsloth_SmolLM-135M_full_1775412609"
     merged_dir.mkdir()
     (merged_dir / "config.json").write_text(
         json.dumps({"_name_or_path": "HuggingFaceTB/SmolLM-135M"})
     )
     (merged_dir / "model.safetensors").write_bytes(b"")
+    (merged_dir / "tokenizer_config.json").write_text("{}")
 
     legacy = scan_trained_loras(str(tmp_path))
 
@@ -199,6 +228,121 @@ def test_get_base_model_from_checkpoint_dir_name_fallback_rejects_empty(
     (empty / "config.json").write_text(json.dumps({"model_type": "llama"}))
 
     assert get_base_model_from_checkpoint(str(empty)) is None
+
+
+def test_get_base_model_from_checkpoint_unwraps_hf_cache_snapshot(
+    tmp_path: Path,
+):
+    """A merged run whose ``config.json`` ``_name_or_path`` points at a
+    Hugging Face cache snapshot directory must surface the canonical
+    ``org/name`` repo id, not the local snapshot path."""
+    checkpoint = tmp_path / "unsloth_Qwen3-4B_1775000400"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(
+        json.dumps(
+            {
+                "_name_or_path": (
+                    "/home/user/.cache/huggingface/hub/"
+                    "models--unsloth--Qwen3-4B/snapshots/abc123"
+                ),
+            }
+        )
+    )
+    (checkpoint / "tokenizer.json").write_text("{}")
+    (checkpoint / "model.safetensors").write_bytes(b"")
+
+    assert get_base_model_from_checkpoint(str(checkpoint)) == "unsloth/Qwen3-4B"
+
+
+def test_get_base_model_from_checkpoint_unwraps_cache_with_hyphenated_name(
+    tmp_path: Path,
+):
+    """HF cache parser must preserve hyphens in model names and handle
+    double-dashed org names correctly."""
+    checkpoint = tmp_path / "unsloth_mistral-7b_1775000500"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(
+        json.dumps(
+            {
+                "_name_or_path": (
+                    "/a/b/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/deadbeef"
+                ),
+            }
+        )
+    )
+    (checkpoint / "tokenizer.json").write_text("{}")
+    (checkpoint / "model.safetensors").write_bytes(b"")
+
+    assert (
+        get_base_model_from_checkpoint(str(checkpoint))
+        == "meta-llama/Llama-3.2-1B-Instruct"
+    )
+
+
+def test_get_base_model_from_checkpoint_generic_dir_name_non_unsloth(
+    tmp_path: Path,
+):
+    """A merged run saved under a non-unsloth_ dir name (Studio does
+    ``model_name.replace("/", "_")``) must still resolve back to the
+    ``org/model`` repo id via the generic directory-name parser, even
+    when ``config.json`` is absent or self-referential."""
+    qwen = tmp_path / "Qwen_Qwen3-4B_1775000200"
+    qwen.mkdir()
+    # No config.json: dir-name fallback is the only signal.
+
+    assert get_base_model_from_checkpoint(str(qwen)) == "Qwen/Qwen3-4B"
+
+    meta = tmp_path / "meta-llama_Llama-3.2-1B_1775000300"
+    meta.mkdir()
+
+    assert (
+        get_base_model_from_checkpoint(str(meta)) == "meta-llama/Llama-3.2-1B"
+    )
+
+
+def test_parse_unsloth_dir_name_requires_numeric_timestamp():
+    """Arbitrary ``unsloth_*`` names without a numeric trailing
+    component must not fabricate a base model."""
+    from utils.models.model_config import _parse_unsloth_dir_name
+
+    assert _parse_unsloth_dir_name("unsloth_Qwen3-4B_final") is None
+    assert _parse_unsloth_dir_name("unsloth_Qwen3-4B_1775000001") == "unsloth/Qwen3-4B"
+
+
+def test_parse_generic_training_dir_name_edge_cases():
+    from utils.models.model_config import _parse_generic_training_dir_name
+
+    assert _parse_generic_training_dir_name("Qwen_Qwen3-4B_1775000001") == "Qwen/Qwen3-4B"
+    assert (
+        _parse_generic_training_dir_name("meta-llama_Llama-3.2-1B_1234567890")
+        == "meta-llama/Llama-3.2-1B"
+    )
+    # Not enough parts
+    assert _parse_generic_training_dir_name("just_name") is None
+    # Trailing not numeric
+    assert _parse_generic_training_dir_name("org_model_v1") is None
+    # Empty leading segment
+    assert _parse_generic_training_dir_name("_model_1234567890") is None
+    # Empty model segment
+    assert _parse_generic_training_dir_name("org__1234567890") is None
+
+
+def test_has_tokenizer_files_detects_any_tokenizer_artifact(tmp_path: Path):
+    from utils.models.model_config import _has_tokenizer_files
+
+    assert _has_tokenizer_files(tmp_path) is False
+    (tmp_path / "tokenizer_config.json").write_text("{}")
+    assert _has_tokenizer_files(tmp_path) is True
+
+    tmp2 = tmp_path / "other"
+    tmp2.mkdir()
+    (tmp2 / "tokenizer.json").write_text("{}")
+    assert _has_tokenizer_files(tmp2) is True
+
+    tmp3 = tmp_path / "spm"
+    tmp3.mkdir()
+    (tmp3 / "tokenizer.model").write_bytes(b"")
+    assert _has_tokenizer_files(tmp3) is True
 
 
 def test_scan_trained_models_survives_entry_level_errors(tmp_path: Path):
