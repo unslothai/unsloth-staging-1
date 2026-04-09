@@ -807,6 +807,16 @@ export function ChatPage(): ReactElement {
         if (canceled) return;
 
         const state = useChatRuntimeStore.getState();
+        // Resolve the handoff base model against the refreshed model list
+        // using normalizeModelRef so a case or cache-id mismatch between
+        // the training request (e.g. "unsloth/qwen3-4b") and the runtime
+        // store (e.g. "unsloth/Qwen3-4B") does not break the fallback.
+        const handoffBaseNorm = normalizeModelRef(handoff.baseModel);
+        const resolvedBaseModel = handoffBaseNorm
+          ? state.models.find(
+              (model) => normalizeModelRef(model.id) === handoffBaseNorm,
+            )?.id ?? handoff.baseModel
+          : handoff.baseModel;
         const targetLora = pickBestLoraForBase(state.loras, handoff.baseModel);
         if (targetLora) {
           const targetIsLora = isLoraAdapter(targetLora.exportType);
@@ -828,15 +838,16 @@ export function ChatPage(): ReactElement {
           // one-sided empty compare.
           if (
             !targetIsLora &&
-            handoff.baseModel &&
-            state.models.some((model) => model.id === handoff.baseModel)
+            resolvedBaseModel &&
+            state.models.some((model) => model.id === resolvedBaseModel)
           ) {
             setPendingCompareSeed({
               pairId,
-              model1: { id: handoff.baseModel, isLora: false },
+              model1: { id: resolvedBaseModel, isLora: false },
               model2: { id: targetLora.id, isLora: false },
             });
           }
+          if (canceled) return;
           setView({ mode: "compare", pairId });
           useChatRuntimeStore.getState().setActiveThreadId(null);
           useChatRuntimeStore.getState().setContextUsage(null);
@@ -846,14 +857,14 @@ export function ChatPage(): ReactElement {
         }
 
         if (
-          handoff.baseModel &&
-          state.models.some((model) => model.id === handoff.baseModel)
+          resolvedBaseModel &&
+          state.models.some((model) => model.id === resolvedBaseModel)
         ) {
           console.info("[chat-handoff] no lora match, loading base", {
-            id: handoff.baseModel,
+            id: resolvedBaseModel,
           });
           await selectModelRef.current({
-            id: handoff.baseModel,
+            id: resolvedBaseModel,
             isLora: false,
           });
           if (canceled) return;
@@ -876,6 +887,16 @@ export function ChatPage(): ReactElement {
       canceled = true;
     };
   }, []);
+
+  // Clear the compare seed after the matching CompareContent has mounted
+  // so a future manual compare entry never replays a stale base/fine-tuned
+  // pair. The pairId-match gate at the render site already prevents cross
+  // use, but explicit cleanup is safer against future pairId reuse.
+  useEffect(() => {
+    if (pendingCompareSeed && pendingCompareSeed.pairId === view.pairId) {
+      setPendingCompareSeed(null);
+    }
+  }, [view.pairId, pendingCompareSeed]);
 
   const tourSteps = useMemo(
     () =>
@@ -970,7 +991,9 @@ export function ChatPage(): ReactElement {
                   label={
                     loadProgress?.phase === "starting"
                       ? "Starting model…"
-                      : loadingModel.isDownloaded || loadingModel.isCachedLora
+                      : loadingModel.isDownloaded ||
+                          loadingModel.isCachedLora ||
+                          loadingModel.isLocalCached
                         ? "Loading model…"
                         : "Downloading model…"
                   }
@@ -979,7 +1002,9 @@ export function ChatPage(): ReactElement {
                       ? `Loading ${loadingModel.displayName} from cache.`
                       : loadingModel.isCachedLora
                         ? `Loading ${loadingModel.displayName} into memory.`
-                        : `Loading ${loadingModel.displayName}. This may include downloading.`
+                        : loadingModel.isLocalCached
+                          ? `Loading ${loadingModel.displayName} from disk.`
+                          : `Loading ${loadingModel.displayName}. This may include downloading.`
                   }
                   progressPercent={loadProgress?.percent}
                   progressLabel={loadProgress?.label}

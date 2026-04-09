@@ -796,6 +796,16 @@ async def scan_loras(
         trained_models = scan_trained_models(outputs_dir = resolved_outputs_dir)
         for display_name, model_path, model_type in trained_models:
             base_model = get_base_model_from_checkpoint(model_path)
+            # Hide merged embedding-model finetunes from the chat picker:
+            # the chat runtime has no embedding-only load path, so listing
+            # them would surface an unloadable entry. LoRA adapters stay
+            # visible because they run through the normal base-model load.
+            if model_type == "merged" and base_model:
+                try:
+                    if is_embedding_model(base_model):
+                        continue
+                except Exception:
+                    pass
             lora_list.append(
                 LoRAInfo(
                     display_name = display_name,

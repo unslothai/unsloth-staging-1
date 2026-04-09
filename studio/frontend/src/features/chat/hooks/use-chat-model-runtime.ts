@@ -554,20 +554,20 @@ export function useChatModelRuntime() {
           }
         }
 
-        // Treat any model that is already on disk (downloaded HF cache,
-        // cached LoRA adapter, OR any other local path including merged
-        // full finetunes) as a "cached load" so the toast title reads
-        // "Starting model…" instead of "Downloading model…".
-        const isCachedLoad = isAlreadyLocal;
-        const toastTitle = isCachedLoad ? "Starting model…" : "Downloading model…";
+        // Any model already on disk (downloaded HF cache, cached LoRA
+        // adapter, OR any other local path including merged full finetunes)
+        // reads "Starting model…" instead of "Downloading model…".
+        const toastTitle = isAlreadyLocal
+          ? "Starting model…"
+          : "Downloading model…";
         const toastId = toast(
           null,
           {
             description: renderLoadDescription(
               toastTitle,
               loadingDescription,
-              isCachedLoad ? null : 0,
-              isCachedLoad ? null : "Preparing download",
+              isAlreadyLocal ? null : 0,
+              isAlreadyLocal ? null : "Preparing download",
               cancelLoading,
             ),
             duration: Infinity,

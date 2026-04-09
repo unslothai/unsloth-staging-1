@@ -1410,10 +1410,55 @@ def _parse_unsloth_dir_name(dir_name: str) -> Optional[str]:
     parts = dir_name.split("_")
     if len(parts) < 3:
         return None
+    # Require a numeric timestamp suffix so arbitrary unsloth-prefixed
+    # names do not accidentally resolve to a fake base model.
+    if not parts[-1].isdigit():
+        return None
     model_parts = [p for p in parts[1:-1] if p]
     if not model_parts:
         return None
     return "unsloth/" + "_".join(model_parts)
+
+
+def _parse_generic_training_dir_name(dir_name: str) -> Optional[str]:
+    """Extract an ``org/model`` base repo id from a generic Studio dir name.
+
+    Studio writes outputs using ``model_name.replace("/", "_")``, so a
+    checkpoint trained from ``Qwen/Qwen3-4B`` becomes
+    ``Qwen_Qwen3-4B_<ts>``. This parser recovers the org/model id from
+    that shape. Returns ``None`` if the trailing component is not a
+    numeric timestamp or if any mandatory component is empty.
+    """
+    parts = dir_name.split("_")
+    if len(parts) < 3:
+        return None
+    if not parts[-1].isdigit():
+        return None
+    if not parts[0] or not parts[1]:
+        return None
+    model_parts = parts[1:-1]
+    return f"{parts[0]}/{'_'.join(model_parts)}"
+
+
+def _hf_cache_repo_id_from_path(candidate: str) -> Optional[str]:
+    """Extract an ``org/name`` repo id from a Hugging Face cache path.
+
+    Handles both the classic cache layout
+    ``.../models--org--name/snapshots/<sha>`` and the new cache format
+    ``.../hub/models--org--name/blobs/...``. Returns ``None`` if the
+    path does not look like an HF cache path.
+    """
+    try:
+        parts = Path(candidate).parts
+    except Exception:
+        return None
+    for part in parts:
+        if part.startswith("models--"):
+            pieces = part[len("models--") :].split("--")
+            if len(pieces) < 2 or not pieces[0] or not all(pieces[1:]):
+                return None
+            return f"{pieces[0]}/{'--'.join(pieces[1:])}"
+    return None
 
 
 def scan_trained_models(
@@ -1659,10 +1704,17 @@ def get_base_model_from_checkpoint(checkpoint_path: str) -> Optional[str]:
 
         adapter_config_path = checkpoint_path_obj / "adapter_config.json"
         if adapter_config_path.exists():
-            with open(adapter_config_path, "r") as f:
+            with open(adapter_config_path, "r", encoding = "utf-8") as f:
                 config = json.load(f)
                 base_model = config.get("base_model_name_or_path")
                 if base_model:
+                    cache_repo = _hf_cache_repo_id_from_path(str(base_model))
+                    if cache_repo:
+                        logger.info(
+                            "Recovered base model from adapter_config.json HF cache path: %s",
+                            cache_repo,
+                        )
+                        return cache_repo
                     logger.info(
                         "Detected base model from adapter_config.json: %s", base_model
                     )
@@ -1670,7 +1722,7 @@ def get_base_model_from_checkpoint(checkpoint_path: str) -> Optional[str]:
 
         config_path = checkpoint_path_obj / "config.json"
         if config_path.exists():
-            with open(config_path, "r") as f:
+            with open(config_path, "r", encoding = "utf-8") as f:
                 config = json.load(f)
                 for key in ("model_name", "_name_or_path"):
                     base_model = config.get(key)
@@ -1678,6 +1730,17 @@ def get_base_model_from_checkpoint(checkpoint_path: str) -> Optional[str]:
                         continue
                     if _same_checkpoint_path(str(base_model), checkpoint_path_obj):
                         continue
+                    # If the stored value is an HF cache path, recover the
+                    # canonical repo id rather than returning the local
+                    # snapshot directory as the "base model".
+                    cache_repo = _hf_cache_repo_id_from_path(str(base_model))
+                    if cache_repo:
+                        logger.info(
+                            "Recovered base model from config.json (%s) HF cache path: %s",
+                            key,
+                            cache_repo,
+                        )
+                        return cache_repo
                     logger.info(
                         "Detected base model from config.json (%s): %s",
                         key,
@@ -1690,7 +1753,16 @@ def get_base_model_from_checkpoint(checkpoint_path: str) -> Optional[str]:
         # from files on disk. adapter_config.json and config.json above
         # already cover every Studio-produced checkpoint.
 
-        base_model = _parse_unsloth_dir_name(checkpoint_path_obj.name)
+        # Directory-name heuristics. Studio writes outputs using
+        # ``model_name.replace("/", "_")`` so both the unsloth-specific
+        # prefix form and the generic ``<org>_<model>_<ts>`` form are
+        # supported. The unsloth form is tried first because it is the
+        # most common Studio output shape.
+        dir_name = checkpoint_path_obj.name
+        base_model = (
+            _parse_unsloth_dir_name(dir_name)
+            or _parse_generic_training_dir_name(dir_name)
+        )
         if base_model:
             logger.info(
                 "Detected base model from directory name: %s", base_model
@@ -1724,10 +1796,17 @@ def get_base_model_from_lora(lora_path: str) -> Optional[str]:
         # Try adapter_config.json first
         adapter_config_path = lora_path_obj / "adapter_config.json"
         if adapter_config_path.exists():
-            with open(adapter_config_path, "r") as f:
+            with open(adapter_config_path, "r", encoding = "utf-8") as f:
                 config = json.load(f)
                 base_model = config.get("base_model_name_or_path")
                 if base_model:
+                    cache_repo = _hf_cache_repo_id_from_path(str(base_model))
+                    if cache_repo:
+                        logger.info(
+                            "Recovered base model from adapter_config.json HF cache path: %s",
+                            cache_repo,
+                        )
+                        return cache_repo
                     logger.info(
                         "Detected base model from adapter_config.json: %s", base_model
                     )
@@ -1738,9 +1817,14 @@ def get_base_model_from_lora(lora_path: str) -> Optional[str]:
         # from files on disk. adapter_config.json above already covers every
         # Studio-produced LoRA run.
 
-        # Last resort: parse from directory name.
-        # Format: unsloth_Meta-Llama-3.1-8B-Instruct-bnb-4bit_timestamp
-        base_model = _parse_unsloth_dir_name(lora_path_obj.name)
+        # Last resort: parse from directory name. Studio writes outputs
+        # using ``model_name.replace("/", "_")``, so support both the
+        # unsloth prefix form and the generic ``<org>_<model>_<ts>`` form.
+        dir_name = lora_path_obj.name
+        base_model = (
+            _parse_unsloth_dir_name(dir_name)
+            or _parse_generic_training_dir_name(dir_name)
+        )
         if base_model:
             logger.info(
                 "Detected base model from directory name: %s", base_model
