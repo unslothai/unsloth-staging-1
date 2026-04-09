@@ -18,6 +18,12 @@ from utils.paths import (
     resolve_output_dir,
     resolve_export_dir,
 )
+from utils.paths import (
+    cache_root as _studio_cache_root,
+    legacy_hf_cache_dir as _legacy_hf_cache_dir,
+    hf_default_cache_dir as _hf_default_cache_dir,
+    lmstudio_model_dirs as _lmstudio_model_dirs,
+)
 from utils.utils import without_hf_auth
 import structlog
 from loggers import get_logger
@@ -1461,6 +1467,92 @@ def _hf_cache_repo_id_from_path(candidate: str) -> Optional[str]:
     return None
 
 
+def _allowed_model_path_roots() -> List[Path]:
+    """Return the list of directory roots a caller is allowed to point
+    ``get_base_model_from_lora`` / ``get_base_model_from_checkpoint`` at.
+
+    The HTTP routes expose these helpers with user-controlled path inputs
+    (``GET /loras/{lora_path}/base-model``, ``POST /export/load-checkpoint``,
+    ``GET /loras?outputs_dir=...``). An uncanonicalized path lets a caller
+    probe arbitrary directories on the host (CodeQL ``py/path-injection``).
+    Limiting accepted paths to Studio-managed roots bounds the blast radius
+    to directories Studio itself writes to or consults.
+    """
+    roots: List[Path] = []
+    try:
+        roots.append(outputs_root())
+        roots.append(exports_root())
+    except Exception:
+        pass
+    try:
+        roots.append(_studio_cache_root())
+    except Exception:
+        pass
+    try:
+        roots.append(_legacy_hf_cache_dir())
+    except Exception:
+        pass
+    try:
+        roots.append(_hf_default_cache_dir())
+    except Exception:
+        pass
+    # Respect explicit HF environment overrides
+    for env_key in ("HF_HUB_CACHE", "HF_HOME"):
+        env_val = os.environ.get(env_key)
+        if env_val:
+            roots.append(Path(env_val))
+            if env_key == "HF_HOME":
+                roots.append(Path(env_val) / "hub")
+    try:
+        roots.extend(_lmstudio_model_dirs())
+    except Exception:
+        pass
+    return roots
+
+
+def _canonicalize_model_path(path_str: str) -> Optional[Path]:
+    """Resolve ``path_str`` and verify it lives under a Studio-managed root.
+
+    Path sanitizer for CodeQL ``py/path-injection``. The returned ``Path``
+    is the canonical (``resolve()``'d, symlink-expanded) form, guaranteed
+    to be a descendant of one of the roots in :func:`_allowed_model_path_roots`.
+
+    Returns ``None`` when:
+      * ``path_str`` is empty or falsy
+      * ``resolve()`` raises ``OSError`` / ``RuntimeError`` (bad symlink loop)
+      * the canonical path is not under any allowed root
+
+    Callers should treat ``None`` the same as "path not found" — existing
+    code paths already handle that case.
+    """
+    if not path_str:
+        return None
+    try:
+        resolved = Path(path_str).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return None
+
+    resolved_str = str(resolved)
+    for root in _allowed_model_path_roots():
+        try:
+            root_resolved = root.expanduser().resolve()
+        except (OSError, RuntimeError):
+            continue
+        root_str = str(root_resolved)
+        # Explicit string-prefix check — recognized by CodeQL's
+        # path-injection sanitizer detection. ``is_relative_to`` is also
+        # correct but not always picked up by the dataflow analysis.
+        if resolved_str == root_str or resolved_str.startswith(root_str + os.sep):
+            return resolved
+
+    logger.warning(
+        "Rejected model path outside Studio roots: %s (resolved: %s)",
+        path_str,
+        resolved_str,
+    )
+    return None
+
+
 def scan_trained_models(
     outputs_dir: str = str(outputs_root()),
 ) -> List[Tuple[str, str, str]]:
@@ -1700,7 +1792,13 @@ def _same_checkpoint_path(candidate: str, checkpoint_path_obj: Path) -> bool:
 def get_base_model_from_checkpoint(checkpoint_path: str) -> Optional[str]:
     """Read the base model name from a local training or checkpoint directory."""
     try:
-        checkpoint_path_obj = Path(checkpoint_path)
+        # Sanitize the caller-supplied path against Studio-managed roots to
+        # block path-traversal through ``POST /export/load-checkpoint`` and
+        # related HTTP entry points. All subsequent filesystem access uses
+        # the canonical path, not the raw input string.
+        checkpoint_path_obj = _canonicalize_model_path(checkpoint_path)
+        if checkpoint_path_obj is None:
+            return None
 
         adapter_config_path = checkpoint_path_obj / "adapter_config.json"
         if adapter_config_path.exists():
@@ -1788,7 +1886,13 @@ def get_base_model_from_lora(lora_path: str) -> Optional[str]:
         Base model identifier or None if not found
     """
     try:
-        lora_path_obj = Path(lora_path)
+        # Sanitize the caller-supplied path against Studio-managed roots to
+        # block path-traversal through ``GET /loras/{lora_path}/base-model``
+        # and related HTTP entry points. All subsequent filesystem access
+        # uses the canonical path, not the raw input string.
+        lora_path_obj = _canonicalize_model_path(lora_path)
+        if lora_path_obj is None:
+            return None
 
         if not _looks_like_lora_adapter(lora_path_obj):
             return None
