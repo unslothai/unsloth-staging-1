@@ -373,11 +373,15 @@ export function useChatModelRuntime() {
       // Covers Unix absolute (/), relative (./  ../), tilde (~/), Windows drive (C:\), UNC (\\server)
       const isLocal = /^(\/|\.{1,2}[\\/]|~[\\/]|[A-Za-z]:[\\/]|\\\\)/.test(modelId);
       const isCachedLora = isLora && isLocal;
+      // Any local-on-disk model (LoRA adapter OR merged full finetune) is
+      // already cached, so it should not drop into the remote-download
+      // loading state.
+      const isLocalCached = isLocal && !isDownloaded;
       const loadingDescription = [
         currentCheckpoint ? "Switching models." : null,
         extraLoadingDescription ?? null,
         isDownloaded ? "Loading cached model into memory." : null,
-        !isDownloaded && isCachedLora ? "Loading trained model into memory." : null,
+        !isDownloaded && isLocalCached ? "Loading trained model into memory." : null,
       ]
         .filter(Boolean)
         .join(" ");
@@ -387,7 +391,7 @@ export function useChatModelRuntime() {
       setLoadingModel(loadInfo);
       useChatRuntimeStore.getState().setModelLoading(true);
       setLoadProgress(
-        isDownloaded || isCachedLora
+        isDownloaded || isCachedLora || isLocalCached
           ? { percent: null, label: null, phase: "starting" }
           : { percent: 0, label: "Preparing download", phase: "downloading" },
       );

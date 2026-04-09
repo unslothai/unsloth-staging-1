@@ -82,20 +82,34 @@ function pickBestLoraForBase(
   loras: LoraCandidate[],
   baseModel: string | null,
 ): LoraCandidate | null {
-  const adapterOnly = loras.filter((lora) => lora.exportType === "lora");
-  if (adapterOnly.length === 0) return null;
-  const sorted = [...adapterOnly].sort(
-    (a, b) => (b.updatedAt ?? -1) - (a.updatedAt ?? -1),
+  // Accept any trained output (LoRA adapter or merged full finetune); a
+  // missing exportType is treated as a LoRA so cached runtime-store
+  // entries from older backends do not get silently dropped.
+  const candidates = loras.filter(
+    (lora) =>
+      lora.exportType === undefined ||
+      lora.exportType === "lora" ||
+      lora.exportType === "merged",
   );
+  if (candidates.length === 0) return null;
+  // Prefer real LoRA adapters over merged full finetunes when both are
+  // available for the same base, since the compare view has a dedicated
+  // fast path for LoRAs.
+  const loraFirst = [...candidates].sort((a, b) => {
+    const aIsLora = a.exportType === undefined || a.exportType === "lora" ? 0 : 1;
+    const bIsLora = b.exportType === undefined || b.exportType === "lora" ? 0 : 1;
+    if (aIsLora !== bIsLora) return aIsLora - bIsLora;
+    return (b.updatedAt ?? -1) - (a.updatedAt ?? -1);
+  });
   const normalizedBase = normalizeModelRef(baseModel);
-  if (!normalizedBase) return sorted[0] ?? null;
+  if (!normalizedBase) return loraFirst[0] ?? null;
 
-  const exact = sorted.find(
+  const exact = loraFirst.find(
     (lora) => normalizeModelRef(lora.baseModel) === normalizedBase,
   );
   if (exact) return exact;
 
-  const partial = sorted.find((lora) => {
+  const partial = loraFirst.find((lora) => {
     const normalizedLoraBase = normalizeModelRef(lora.baseModel);
     if (!normalizedLoraBase) return false;
     return (
@@ -103,7 +117,7 @@ function pickBestLoraForBase(
       normalizedBase.includes(normalizedLoraBase)
     );
   });
-  return partial ?? sorted[0] ?? null;
+  return partial ?? loraFirst[0] ?? null;
 }
 
 function messageHasImage(message: MessageRecord): boolean {
@@ -157,7 +171,11 @@ function useIsLoraCompare(): boolean {
   return useChatRuntimeStore((s) => {
     const cp = s.params.checkpoint;
     const selected = cp ? s.loras.find((l) => l.id === cp) : undefined;
-    return selected?.exportType === "lora";
+    if (selected === undefined) return false;
+    // Treat a missing exportType as a LoRA so cached runtime-store entries
+    // from older backends do not silently drop out of the LoRA compare
+    // fast path.
+    return selected.exportType === "lora" || selected.exportType == null;
   });
 }
 
@@ -764,17 +782,24 @@ export function ChatPage(): ReactElement {
         const state = useChatRuntimeStore.getState();
         const targetLora = pickBestLoraForBase(state.loras, handoff.baseModel);
         if (targetLora) {
-          console.info("[chat-handoff] loading lora", {
+          const targetIsLora =
+            targetLora.exportType === undefined ||
+            targetLora.exportType === "lora";
+          console.info("[chat-handoff] loading trained output", {
             id: targetLora.id,
             baseModel: targetLora.baseModel,
+            exportType: targetLora.exportType,
           });
-          await selectModelRef.current({ id: targetLora.id, isLora: true });
+          await selectModelRef.current({
+            id: targetLora.id,
+            isLora: targetIsLora,
+          });
           if (canceled) return;
           setView({ mode: "compare", pairId: crypto.randomUUID() });
           useChatRuntimeStore.getState().setActiveThreadId(null);
           useChatRuntimeStore.getState().setContextUsage(null);
           clearHandoff();
-          console.info("[chat-handoff] loaded lora + opened compare");
+          console.info("[chat-handoff] loaded trained output + opened compare");
           return;
         }
 

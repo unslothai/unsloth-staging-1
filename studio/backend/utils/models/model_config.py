@@ -1323,17 +1323,28 @@ def is_embedding_model(model_name: str, hf_token: Optional[str] = None) -> bool:
 
 def _has_model_weight_files(model_dir: Path) -> bool:
     """Return True when a directory contains loadable model weights."""
-    for item in model_dir.iterdir():
+    try:
+        entries = list(model_dir.iterdir())
+    except OSError:
+        return False
+
+    for item in entries:
         if not item.is_file():
             continue
 
         suffix = item.suffix.lower()
+        name = item.name.lower()
         if suffix == ".safetensors":
+            # Skip vision projection weights — they are not loadable as a
+            # full model on their own.
+            if "mmproj" in name:
+                continue
             return True
         if suffix == ".gguf":
-            return "mmproj" not in item.name.lower()
+            if "mmproj" in name:
+                continue
+            return True
         if suffix == ".bin":
-            name = item.name.lower()
             if (
                 name.startswith("pytorch_model")
                 or name.startswith("model")
@@ -1344,11 +1355,17 @@ def _has_model_weight_files(model_dir: Path) -> bool:
     return False
 
 
+def _looks_like_lora_adapter(model_dir: Path) -> bool:
+    return model_dir.is_dir() and (
+        (model_dir / "adapter_config.json").exists()
+        or any(model_dir.glob("adapter_model*.safetensors"))
+        or any(model_dir.glob("adapter_model*.bin"))
+    )
+
+
 def _detect_training_output_type(model_dir: Path) -> Optional[str]:
     """Classify a Studio training output as LoRA or full finetune."""
-    adapter_config = model_dir / "adapter_config.json"
-    adapter_model = model_dir / "adapter_model.safetensors"
-    if adapter_config.exists() or adapter_model.exists():
+    if _looks_like_lora_adapter(model_dir):
         return "lora"
 
     config_file = model_dir / "config.json"
@@ -1356,14 +1373,6 @@ def _detect_training_output_type(model_dir: Path) -> Optional[str]:
         return "merged"
 
     return None
-
-
-def _looks_like_lora_adapter(model_dir: Path) -> bool:
-    return model_dir.is_dir() and (
-        (model_dir / "adapter_config.json").exists()
-        or any(model_dir.glob("adapter_model*.safetensors"))
-        or any(model_dir.glob("adapter_model*.bin"))
-    )
 
 
 def scan_trained_models(
@@ -1385,18 +1394,36 @@ def scan_trained_models(
 
     try:
         for item in outputs_path.iterdir():
-            if item.is_dir():
-                model_type = _detect_training_output_type(item)
-                if model_type is None:
+            # Wrap per-entry classification so a single stat() race or
+            # permission error on one subdirectory does not drop the
+            # whole scan.
+            try:
+                if not item.is_dir():
                     continue
+                model_type = _detect_training_output_type(item)
+            except OSError as e:
+                logger.debug("Skipping unreadable outputs entry %s: %s", item, e)
+                continue
 
-                display_name = item.name
-                model_path = str(item)
-                trained_models.append((display_name, model_path, model_type))
-                logger.debug("Found trained model: %s (%s)", display_name, model_type)
+            if model_type is None:
+                continue
 
-        # Sort by modification time (newest first)
-        trained_models.sort(key = lambda x: Path(x[1]).stat().st_mtime, reverse = True)
+            display_name = item.name
+            model_path = str(item)
+            trained_models.append((display_name, model_path, model_type))
+            logger.debug("Found trained model: %s (%s)", display_name, model_type)
+
+        # Sort by modification time (newest first). Tolerate races where a
+        # directory vanishes between iterdir() and stat(); keep the entry in
+        # the list rather than bubbling up an OSError that would discard
+        # every model we already collected.
+        def _mtime(entry: Tuple[str, str, str]) -> float:
+            try:
+                return Path(entry[1]).stat().st_mtime
+            except OSError:
+                return 0.0
+
+        trained_models.sort(key = _mtime, reverse = True)
 
         logger.info(
             "Found %s trained models in %s",
@@ -1407,7 +1434,28 @@ def scan_trained_models(
 
     except Exception as e:
         logger.error(f"Error scanning outputs folder: {e}")
-        return []
+        # Return any entries already collected so a single late failure
+        # does not wipe the whole scan result.
+        return trained_models
+
+
+def scan_trained_loras(
+    outputs_dir: str = str(outputs_root()),
+) -> List[Tuple[str, str]]:
+    """Backward-compatible wrapper around :func:`scan_trained_models`.
+
+    Returns only LoRA adapter entries as ``(display_name, adapter_path)``
+    tuples so existing callers that unpack two values keep working.
+    Prefer :func:`scan_trained_models` for new code — it also returns
+    merged/full-finetune outputs and exposes the model type.
+    """
+    return [
+        (display_name, model_path)
+        for display_name, model_path, model_type in scan_trained_models(
+            outputs_dir = outputs_dir,
+        )
+        if model_type == "lora"
+    ]
 
 
 def scan_exported_models(
@@ -1536,6 +1584,23 @@ def scan_exported_models(
         return []
 
 
+def _same_checkpoint_path(candidate: str, checkpoint_path_obj: Path) -> bool:
+    """Return True if ``candidate`` refers to the checkpoint directory itself.
+
+    Compares resolved (symlink-expanded, trailing-slash-normalized) paths so
+    that a ``_name_or_path`` of ``"/.../outputs/foo/"`` or a symlinked form
+    of the same directory is recognized as the checkpoint rather than as
+    its base model.
+    """
+    try:
+        return (
+            Path(candidate).expanduser().resolve()
+            == checkpoint_path_obj.resolve()
+        )
+    except OSError:
+        return False
+
+
 def get_base_model_from_checkpoint(checkpoint_path: str) -> Optional[str]:
     """Read the base model name from a local training or checkpoint directory."""
     try:
@@ -1558,43 +1623,41 @@ def get_base_model_from_checkpoint(checkpoint_path: str) -> Optional[str]:
                 config = json.load(f)
                 for key in ("model_name", "_name_or_path"):
                     base_model = config.get(key)
-                    if base_model and str(base_model) != str(checkpoint_path_obj):
-                        logger.info(
-                            "Detected base model from config.json (%s): %s",
-                            key,
-                            base_model,
-                        )
-                        return base_model
-
-        training_args_path = checkpoint_path_obj / "training_args.bin"
-        if training_args_path.exists():
-            try:
-                import torch
-
-                training_args = torch.load(training_args_path)
-                if hasattr(training_args, "model_name_or_path"):
-                    base_model = training_args.model_name_or_path
+                    if not base_model:
+                        continue
+                    if _same_checkpoint_path(str(base_model), checkpoint_path_obj):
+                        continue
                     logger.info(
-                        "Detected base model from training_args.bin: %s", base_model
+                        "Detected base model from config.json (%s): %s",
+                        key,
+                        base_model,
                     )
                     return base_model
-            except Exception as e:
-                logger.warning(f"Could not load training_args.bin: {e}")
+
+        # Note: training_args.bin is intentionally NOT loaded here. It is a
+        # Python pickle whose deserialization would execute arbitrary code
+        # from files on disk. adapter_config.json and config.json above
+        # already cover every Studio-produced checkpoint.
 
         dir_name = checkpoint_path_obj.name
         if dir_name.startswith("unsloth_"):
             parts = dir_name.split("_")
-            if len(parts) >= 2:
-                model_parts = parts[1:-1]
-                base_model = "unsloth/" + "_".join(model_parts)
-                logger.info("Detected base model from directory name: %s", base_model)
-                return base_model
+            # Need at least ["unsloth", <model>, <timestamp>] for the
+            # heuristic to produce a non-empty base model name.
+            if len(parts) >= 3:
+                model_parts = [p for p in parts[1:-1] if p]
+                if model_parts:
+                    base_model = "unsloth/" + "_".join(model_parts)
+                    logger.info(
+                        "Detected base model from directory name: %s", base_model
+                    )
+                    return base_model
 
-        logger.warning(f"Could not detect base model for checkpoint: {checkpoint_path}")
+        logger.warning("Could not detect base model for checkpoint: %s", checkpoint_path)
         return None
 
     except Exception as e:
-        logger.error(f"Error reading base model from checkpoint config: {e}")
+        logger.error("Error reading base model from checkpoint config: %s", e)
         return None
 
 
@@ -1622,44 +1685,36 @@ def get_base_model_from_lora(lora_path: str) -> Optional[str]:
                 base_model = config.get("base_model_name_or_path")
                 if base_model:
                     logger.info(
-                        f"Detected base model from adapter_config.json: {base_model}"
+                        "Detected base model from adapter_config.json: %s", base_model
                     )
                     return base_model
 
-        # Fallback: try training_args.bin (requires torch)
-        training_args_path = lora_path_obj / "training_args.bin"
-        if training_args_path.exists():
-            try:
-                import torch
-
-                training_args = torch.load(training_args_path)
-                if hasattr(training_args, "model_name_or_path"):
-                    base_model = training_args.model_name_or_path
-                    logger.info(
-                        f"Detected base model from training_args.bin: {base_model}"
-                    )
-                    return base_model
-            except Exception as e:
-                logger.warning(f"Could not load training_args.bin: {e}")
+        # Note: training_args.bin is intentionally NOT loaded here. It is a
+        # Python pickle whose deserialization would execute arbitrary code
+        # from files on disk. adapter_config.json above already covers every
+        # Studio-produced LoRA run.
 
         # Last resort: parse from directory name
         # Format: unsloth_Meta-Llama-3.1-8B-Instruct-bnb-4bit_timestamp
         dir_name = lora_path_obj.name
         if dir_name.startswith("unsloth_"):
-            # Remove timestamp suffix (usually _1234567890)
             parts = dir_name.split("_")
-            # Reconstruct model name
-            if len(parts) >= 2:
-                model_parts = parts[1:-1]  # Skip "unsloth" and timestamp
-                base_model = "unsloth/" + "_".join(model_parts)
-                logger.info(f"Detected base model from directory name: {base_model}")
-                return base_model
+            # Need at least ["unsloth", <model>, <timestamp>] for the
+            # heuristic to produce a non-empty base model name.
+            if len(parts) >= 3:
+                model_parts = [p for p in parts[1:-1] if p]
+                if model_parts:
+                    base_model = "unsloth/" + "_".join(model_parts)
+                    logger.info(
+                        "Detected base model from directory name: %s", base_model
+                    )
+                    return base_model
 
-        logger.warning(f"Could not detect base model for LoRA: {lora_path}")
+        logger.warning("Could not detect base model for LoRA: %s", lora_path)
         return None
 
     except Exception as e:
-        logger.error(f"Error reading base model from LoRA config: {e}")
+        logger.error("Error reading base model from LoRA config: %s", e)
         return None
 
 
@@ -1984,13 +2039,12 @@ class ModelConfig:
                     gguf_variant = variant,
                 )
 
-        # Auto-detect LoRA for local paths (check adapter_config.json on disk)
+        # Auto-detect LoRA for local paths (check adapter_config.json on disk).
+        # get_base_model_from_lora() already guards on _looks_like_lora_adapter
+        # internally, so we can call it directly without a second filesystem
+        # check at this site.
         if not is_lora and is_local:
-            detected_base = (
-                get_base_model_from_lora(path)
-                if _looks_like_lora_adapter(Path(path))
-                else None
-            )
+            detected_base = get_base_model_from_lora(path)
             if detected_base:
                 is_lora = True
                 logger.info(
