@@ -2570,8 +2570,13 @@ def detect_host() -> HostInfo:
     # Detect AMD ROCm (HIP) -- require actual GPU, not just tools installed
 
     def _amd_smi_has_gpu(stdout: str) -> bool:
-        """Check for 'GPU: <number>' data rows, not just a table header."""
-        return bool(re.search(r"(?im)^gpu\s*[:\[]\s*\d", stdout))
+        """Check for a GPU data row, not just a table header.
+
+        Accepts the three format variants amd-smi ships across versions:
+        ``GPU: 0``, ``GPU[0]``, and ``GPU 0``. The plain ``GPU`` header
+        line (no following digit) is still rejected.
+        """
+        return bool(re.search(r"(?im)^gpu\s*(?:[:\[]\s*|\s+)\d", stdout))
 
     has_rocm = False
     if is_linux:

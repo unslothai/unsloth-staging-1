@@ -999,8 +999,14 @@ _has_amd_rocm_gpu() {
     fi
     if command -v amd-smi >/dev/null 2>&1; then
         _out=$(amd-smi list 2>/dev/null) || _out=""
+        # Accept any of the three data-row shapes amd-smi has shipped:
+        #   ``GPU: 0``       (colon separator)
+        #   ``GPU[0]``       (bracket wrapper)
+        #   ``GPU 0``        (space then digit, no separator)
+        # The plain header row ``GPU`` alone (no following digit) is
+        # still rejected so we do not confuse headers with data.
         if [ -n "$_out" ] && printf '%s\n' "$_out" \
-            | awk '/^GPU[[:space:]]*[:\[][[:space:]]*[0-9]/{found=1} END{exit !found}'; then
+            | awk '/^GPU[[:space:]]*[:\[][[:space:]]*[0-9]/{found=1; exit} /^GPU[[:space:]]+[0-9]/{found=1; exit} END{exit !found}'; then
             return 0
         fi
     fi

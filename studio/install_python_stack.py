@@ -154,10 +154,15 @@ def _has_rocm_gpu() -> bool:
     for cmd, check_fn in (
         # rocminfo: look for "Name: gfxNNNN" with nonzero first digit (gfx000 is the CPU agent)
         (["rocminfo"], lambda out: bool(re.search(r"gfx[1-9]", out.lower()))),
-        # amd-smi list: require "GPU: <number>" data rows, not just a header
+        # amd-smi list: require a data row with a GPU index. amd-smi
+        # ships three format variants across versions:
+        #   "GPU: 0"   (colon separator)
+        #   "GPU[0]"   (bracket wrapper)
+        #   "GPU 0"    (space then digit, no separator)
+        # The plain "GPU" header (no following digit) is still rejected.
         (
             ["amd-smi", "list"],
-            lambda out: bool(re.search(r"(?im)^gpu\s*[:\[]\s*\d", out)),
+            lambda out: bool(re.search(r"(?im)^gpu\s*(?:[:\[]\s*|\s+)\d", out)),
         ),
     ):
         exe = shutil.which(cmd[0])
@@ -246,6 +251,65 @@ def _radeon_fetch_listing(base_url: str) -> str | None:
         return body.decode("utf-8", errors = "replace")
     except Exception:
         return None
+
+
+def _parse_radeon_wheel_version(url: str) -> tuple[str, str] | None:
+    """Return ``(major, minor)`` for a Radeon wheel URL, else None.
+
+    Mirrors the `_torch_ver`/`_tv_ver`/`_ta_ver` extraction in install.sh.
+    Radeon wheel hrefs are percent-encoded (``torch-2.10.0%2Brocm7.2.0...``)
+    so we URL-decode the filename before parsing and then take the
+    first ``major.minor`` run as the public version.
+    """
+    import re as _re_ver
+    import urllib.parse as _urlparse
+
+    name = url.rsplit("/", 1)[-1]
+    name = _urlparse.unquote(name)
+    m = _re_ver.match(r"^[A-Za-z_]+-([0-9]+)\.([0-9]+)", name)
+    if not m:
+        return None
+    return m.group(1), m.group(2)
+
+
+def _radeon_wheels_compatible(
+    torch_url: str, tv_url: str, ta_url: str
+) -> bool:
+    """Return True when the three Radeon wheels form a compatible trio.
+
+    Ports the `_radeon_versions_match` shell guard:
+
+      - torch.major == torchaudio.major
+      - torch.minor == torchaudio.minor
+      - torchvision.major == 0
+      - torchvision.minor == torch.minor + 15
+
+    The Radeon repo publishes multiple generations simultaneously so
+    picking the highest-version wheel per package can assemble a
+    mismatched trio (torch 2.9 + torchvision 0.23 + torchaudio 2.9).
+    """
+    torch_ver = _parse_radeon_wheel_version(torch_url)
+    tv_ver = _parse_radeon_wheel_version(tv_url)
+    ta_ver = _parse_radeon_wheel_version(ta_url)
+    if torch_ver is None or tv_ver is None or ta_ver is None:
+        return False
+    torch_major, torch_minor = torch_ver
+    ta_major, ta_minor = ta_ver
+    tv_major, tv_minor = tv_ver
+    if torch_major != ta_major:
+        return False
+    if torch_minor != ta_minor:
+        return False
+    if tv_major != "0":
+        return False
+    try:
+        expected_tv_minor = int(torch_minor) + 15
+    except ValueError:
+        return False
+    try:
+        return int(tv_minor) == expected_tv_minor
+    except ValueError:
+        return False
 
 
 def _pick_radeon_wheel_url(
@@ -585,7 +649,25 @@ def _ensure_rocm_torch() -> None:
                     if listing
                     else None
                 )
-                if torch_whl and tv_whl and ta_whl:
+                if not (torch_whl and tv_whl and ta_whl):
+                    print(
+                        "   Radeon repo listing did not contain a compatible "
+                        f"wheel set for {python_tag}; falling back to generic ROCm "
+                        "index"
+                    )
+                elif not _radeon_wheels_compatible(torch_whl, tv_whl, ta_whl):
+                    # The Radeon repo publishes multiple generations in
+                    # the same directory. Picking the highest version
+                    # for each package independently can assemble a
+                    # mismatched trio (torch 2.9 + torchvision 0.23 +
+                    # torchaudio 2.9). Defer to the generic PyTorch
+                    # ROCm index in that case instead of installing an
+                    # incoherent wheel set.
+                    print(
+                        "   Radeon repo yielded a mismatched torch / torchvision / "
+                        "torchaudio trio; falling back to generic ROCm index"
+                    )
+                else:
                     print(
                         f"   Radeon ROCm {radeon_full_ver} -- installing torch from "
                         f"{radeon_base}"
@@ -603,12 +685,6 @@ def _ensure_rocm_torch() -> None:
                     pip_install(*pip_args, constrain = False)
                     radeon_installed = True
                     rocm_torch_ready = True
-                else:
-                    print(
-                        "   Radeon repo listing did not contain a compatible "
-                        f"wheel set for {python_tag}; falling back to generic ROCm "
-                        "index"
-                    )
         if not radeon_installed:
             # Select best matching wheel tag (newest ROCm version <= installed)
             tag = next(
