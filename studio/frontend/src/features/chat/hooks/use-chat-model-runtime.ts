@@ -169,6 +169,7 @@ export function useChatModelRuntime() {
     displayName: string;
     isDownloaded?: boolean;
     isCachedLora?: boolean;
+    isLocalCached?: boolean;
   } | null>(null);
   const [loadToastDismissed, setLoadToastDismissed] = useState(false);
   const [loadProgress, setLoadProgress] = useState<{
@@ -321,7 +322,8 @@ export function useChatModelRuntime() {
     setLoadToastDismissedState(false);
     clearCheckpoint();
     if (tid != null) toast.dismiss(tid);
-    const isCachedOrLocal = model.isDownloaded || model.isCachedLora;
+    const isCachedOrLocal =
+      model.isDownloaded || model.isCachedLora || model.isLocalCached;
     toast.info("Stopped loading model", {
       description: isCachedOrLocal
         ? undefined
@@ -353,7 +355,12 @@ export function useChatModelRuntime() {
         typeof selection === "string" ? false : selection.isDownloaded ?? false;
       const model = models.find((entry) => entry.id === modelId);
       const lora = loras.find((entry) => entry.id === modelId);
-      const loraIsAdapter = lora?.exportType === "lora";
+      // A trained output counts as a LoRA adapter when exportType is the
+      // explicit "lora" string OR missing entirely (legacy cached entries
+      // from older backends did not carry this field).
+      const loraIsAdapter =
+        lora !== undefined &&
+        (lora.exportType === "lora" || lora.exportType == null);
       const isLora =
         explicitIsLora ?? model?.isLora ?? loraIsAdapter ?? false;
       const displayName = model?.name || lora?.name || modelId;
@@ -368,30 +375,49 @@ export function useChatModelRuntime() {
       const previousLora = previousCheckpoint
         ? loras.find((entry) => entry.id === previousCheckpoint)
         : undefined;
+      // Rollback: treat a previous LoRA entry with a missing exportType
+      // the same as an adapter, so legacy cached entries from older
+      // backends are re-loaded through the adapter path on recovery
+      // rather than incorrectly falling into the base-model path.
       const previousIsLora =
-        previousModel?.isLora ?? (previousLora?.exportType === "lora");
+        previousModel?.isLora ??
+        (previousLora !== undefined &&
+          (previousLora.exportType === "lora" ||
+            previousLora.exportType == null));
       // Covers Unix absolute (/), relative (./  ../), tilde (~/), Windows drive (C:\), UNC (\\server)
       const isLocal = /^(\/|\.{1,2}[\\/]|~[\\/]|[A-Za-z]:[\\/]|\\\\)/.test(modelId);
       const isCachedLora = isLora && isLocal;
-      // Any local-on-disk model (LoRA adapter OR merged full finetune) is
-      // already cached, so it should not drop into the remote-download
-      // loading state.
+      // Any local-on-disk model (LoRA adapter OR merged full finetune
+      // OR any other local path the user pasted in) is already cached,
+      // so it should not drop into the remote-download loading state or
+      // the downloading toast copy path.
       const isLocalCached = isLocal && !isDownloaded;
+      const isAlreadyLocal = isDownloaded || isCachedLora || isLocalCached;
       const loadingDescription = [
         currentCheckpoint ? "Switching models." : null,
         extraLoadingDescription ?? null,
         isDownloaded ? "Loading cached model into memory." : null,
-        !isDownloaded && isLocalCached ? "Loading trained model into memory." : null,
+        !isDownloaded && isCachedLora
+          ? "Loading trained model into memory."
+          : !isDownloaded && isLocalCached
+            ? "Loading local model into memory."
+            : null,
       ]
         .filter(Boolean)
         .join(" ");
       setModelsError(null);
       setLoadToastDismissedState(false);
-      const loadInfo = { id: modelId, displayName, isDownloaded, isCachedLora };
+      const loadInfo = {
+        id: modelId,
+        displayName,
+        isDownloaded,
+        isCachedLora,
+        isLocalCached,
+      };
       setLoadingModel(loadInfo);
       useChatRuntimeStore.getState().setModelLoading(true);
       setLoadProgress(
-        isDownloaded || isCachedLora || isLocalCached
+        isAlreadyLocal
           ? { percent: null, label: null, phase: "starting" }
           : { percent: 0, label: "Preparing download", phase: "downloading" },
       );
@@ -528,7 +554,11 @@ export function useChatModelRuntime() {
           }
         }
 
-        const isCachedLoad = isDownloaded || isCachedLora;
+        // Treat any model that is already on disk (downloaded HF cache,
+        // cached LoRA adapter, OR any other local path including merged
+        // full finetunes) as a "cached load" so the toast title reads
+        // "Starting model…" instead of "Downloading model…".
+        const isCachedLoad = isAlreadyLocal;
         const toastTitle = isCachedLoad ? "Starting model…" : "Downloading model…";
         const toastId = toast(
           null,
@@ -553,9 +583,11 @@ export function useChatModelRuntime() {
         );
         loadToastIdRef.current = toastId;
 
-        // Poll download progress for non-cached models (GGUF and non-GGUF)
+        // Poll download progress only for models that are NOT already on
+        // disk. A local path (merged full finetune, etc.) has nothing to
+        // download and should skip the polling loop entirely.
         let progressInterval: ReturnType<typeof setInterval> | null = null;
-        if (!isDownloaded && !isCachedLora) {
+        if (!isAlreadyLocal) {
           const expectedBytes =
             typeof selection !== "string" ? selection.expectedBytes ?? 0 : 0;
           let hasShownProgress = false;

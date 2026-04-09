@@ -78,38 +78,41 @@ function normalizeModelRef(value: string | null | undefined): string {
   return value?.trim().toLowerCase() ?? "";
 }
 
+// A trained output entry counts as a LoRA adapter for load/compare
+// purposes when its exportType is the explicit "lora" string OR missing
+// entirely (legacy runtime-store entries from older backends did not
+// carry this field).
+function isLoraAdapter(
+  exportType: LoraCandidate["exportType"] | null | undefined,
+): boolean {
+  return exportType === "lora" || exportType == null;
+}
+
 function pickBestLoraForBase(
   loras: LoraCandidate[],
   baseModel: string | null,
 ): LoraCandidate | null {
-  // Accept any trained output (LoRA adapter or merged full finetune); a
-  // missing exportType is treated as a LoRA so cached runtime-store
-  // entries from older backends do not get silently dropped.
-  const candidates = loras.filter(
-    (lora) =>
-      lora.exportType === undefined ||
-      lora.exportType === "lora" ||
-      lora.exportType === "merged",
-  );
+  // Accept LoRA adapters and merged full finetunes; exclude GGUF exports
+  // which are not loadable via the LoRA/compare path. Unknown export
+  // types (null/undefined from older cached entries) are treated as LoRA.
+  const candidates = loras.filter((lora) => lora.exportType !== "gguf");
   if (candidates.length === 0) return null;
-  // Prefer real LoRA adapters over merged full finetunes when both are
-  // available for the same base, since the compare view has a dedicated
-  // fast path for LoRAs.
-  const loraFirst = [...candidates].sort((a, b) => {
-    const aIsLora = a.exportType === undefined || a.exportType === "lora" ? 0 : 1;
-    const bIsLora = b.exportType === undefined || b.exportType === "lora" ? 0 : 1;
-    if (aIsLora !== bIsLora) return aIsLora - bIsLora;
-    return (b.updatedAt ?? -1) - (a.updatedAt ?? -1);
-  });
+  // Sort newest-first so the training handoff always picks the most
+  // recent matching output. We do NOT demote merged checkpoints behind
+  // older LoRAs — after a fresh full finetune the user expects to see
+  // the run they just trained, not a stale adapter for the same base.
+  const sorted = [...candidates].sort(
+    (a, b) => (b.updatedAt ?? -1) - (a.updatedAt ?? -1),
+  );
   const normalizedBase = normalizeModelRef(baseModel);
-  if (!normalizedBase) return loraFirst[0] ?? null;
+  if (!normalizedBase) return sorted[0] ?? null;
 
-  const exact = loraFirst.find(
+  const exact = sorted.find(
     (lora) => normalizeModelRef(lora.baseModel) === normalizedBase,
   );
   if (exact) return exact;
 
-  const partial = loraFirst.find((lora) => {
+  const partial = sorted.find((lora) => {
     const normalizedLoraBase = normalizeModelRef(lora.baseModel);
     if (!normalizedLoraBase) return false;
     return (
@@ -117,7 +120,10 @@ function pickBestLoraForBase(
       normalizedBase.includes(normalizedLoraBase)
     );
   });
-  return partial ?? loraFirst[0] ?? null;
+  // On a base-model miss, return null rather than silently loading an
+  // unrelated artifact. The caller already has a safe base-model
+  // fallback path below — we must not short-circuit it.
+  return partial ?? null;
 }
 
 function messageHasImage(message: MessageRecord): boolean {
@@ -171,11 +177,7 @@ function useIsLoraCompare(): boolean {
   return useChatRuntimeStore((s) => {
     const cp = s.params.checkpoint;
     const selected = cp ? s.loras.find((l) => l.id === cp) : undefined;
-    if (selected === undefined) return false;
-    // Treat a missing exportType as a LoRA so cached runtime-store entries
-    // from older backends do not silently drop out of the LoRA compare
-    // fast path.
-    return selected.exportType === "lora" || selected.exportType == null;
+    return selected !== undefined && isLoraAdapter(selected.exportType);
   });
 }
 
@@ -184,11 +186,15 @@ const CompareContent = memo(function CompareContent({
   models,
   loraModels,
   onFoldersChange,
+  initialModel1,
+  initialModel2,
 }: {
   pairId: string;
   models: ModelOption[];
   loraModels: LoraModelOption[];
   onFoldersChange?: () => void;
+  initialModel1?: CompareModelSelection;
+  initialModel2?: CompareModelSelection;
 }): ReactElement {
   const isLoraCompare = useIsLoraCompare();
 
@@ -200,6 +206,8 @@ const CompareContent = memo(function CompareContent({
       models={models}
       loraModels={loraModels}
       onFoldersChange={onFoldersChange}
+      initialModel1={initialModel1}
+      initialModel2={initialModel2}
     />
   );
 });
@@ -286,11 +294,18 @@ const GeneralCompareContent = memo(function GeneralCompareContent({
   models,
   loraModels,
   onFoldersChange,
+  initialModel1,
+  initialModel2,
 }: {
   pairId: string;
   models: ModelOption[];
   loraModels: LoraModelOption[];
   onFoldersChange?: () => void;
+  // Optional seeds for the two panes. Used by the training-handoff path
+  // so that a merged full finetune run lands in a preconfigured
+  // "base vs fine-tuned" compare view instead of a one-sided empty pair.
+  initialModel1?: CompareModelSelection;
+  initialModel2?: CompareModelSelection;
 }): ReactElement {
   const handlesRef = useRef<Record<string, CompareHandle>>({});
   const [model1ThreadId, setModel1ThreadId] = useState<string>();
@@ -298,15 +313,19 @@ const GeneralCompareContent = memo(function GeneralCompareContent({
 
   const globalCheckpoint = useChatRuntimeStore((s) => s.params.checkpoint);
   const globalGgufVariant = useChatRuntimeStore((s) => s.activeGgufVariant);
-  const [model1, setModel1] = useState<CompareModelSelection>({
-    id: globalCheckpoint || "",
-    isLora: false,
-    ggufVariant: globalGgufVariant ?? undefined,
-  });
-  const [model2, setModel2] = useState<CompareModelSelection>({
-    id: "",
-    isLora: false,
-  });
+  const [model1, setModel1] = useState<CompareModelSelection>(
+    initialModel1 ?? {
+      id: globalCheckpoint || "",
+      isLora: false,
+      ggufVariant: globalGgufVariant ?? undefined,
+    },
+  );
+  const [model2, setModel2] = useState<CompareModelSelection>(
+    initialModel2 ?? {
+      id: "",
+      isLora: false,
+    },
+  );
 
   useEffect(() => {
     let isActive = true;
@@ -524,6 +543,14 @@ export function ChatPage(): ReactElement {
   const [viewBeforeCompare, setViewBeforeCompare] = useState<ChatView | null>(
     null,
   );
+  // Optional seeds consumed by CompareContent on the next compare mount.
+  // Used by the training-handoff path so a merged full finetune run lands
+  // in a preconfigured base-vs-fine-tuned pair instead of a one-sided view.
+  const [pendingCompareSeed, setPendingCompareSeed] = useState<{
+    pairId: string;
+    model1?: CompareModelSelection;
+    model2?: CompareModelSelection;
+  } | null>(null);
   const inferenceParams = useChatRuntimeStore((state) => state.params);
   const setInferenceParams = useChatRuntimeStore((state) => state.setParams);
   const activeGgufVariant = useChatRuntimeStore(
@@ -782,9 +809,7 @@ export function ChatPage(): ReactElement {
         const state = useChatRuntimeStore.getState();
         const targetLora = pickBestLoraForBase(state.loras, handoff.baseModel);
         if (targetLora) {
-          const targetIsLora =
-            targetLora.exportType === undefined ||
-            targetLora.exportType === "lora";
+          const targetIsLora = isLoraAdapter(targetLora.exportType);
           console.info("[chat-handoff] loading trained output", {
             id: targetLora.id,
             baseModel: targetLora.baseModel,
@@ -795,7 +820,24 @@ export function ChatPage(): ReactElement {
             isLora: targetIsLora,
           });
           if (canceled) return;
-          setView({ mode: "compare", pairId: crypto.randomUUID() });
+          const pairId = crypto.randomUUID();
+          // For merged full-finetune runs, compare mode falls through
+          // to GeneralCompareContent — seed both panes with the base
+          // model on the left and the trained output on the right so
+          // the view is a real base-vs-fine-tuned pair instead of a
+          // one-sided empty compare.
+          if (
+            !targetIsLora &&
+            handoff.baseModel &&
+            state.models.some((model) => model.id === handoff.baseModel)
+          ) {
+            setPendingCompareSeed({
+              pairId,
+              model1: { id: handoff.baseModel, isLora: false },
+              model2: { id: targetLora.id, isLora: false },
+            });
+          }
+          setView({ mode: "compare", pairId });
           useChatRuntimeStore.getState().setActiveThreadId(null);
           useChatRuntimeStore.getState().setContextUsage(null);
           clearHandoff();
@@ -984,6 +1026,16 @@ export function ChatPage(): ReactElement {
               models={models}
               loraModels={loraModels}
               onFoldersChange={refreshLocalModels}
+              initialModel1={
+                pendingCompareSeed?.pairId === view.pairId
+                  ? pendingCompareSeed.model1
+                  : undefined
+              }
+              initialModel2={
+                pendingCompareSeed?.pairId === view.pairId
+                  ? pendingCompareSeed.model2
+                  : undefined
+              }
             />
           )}
         </div>

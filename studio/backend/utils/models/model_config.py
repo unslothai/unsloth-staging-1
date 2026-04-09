@@ -1363,16 +1363,57 @@ def _looks_like_lora_adapter(model_dir: Path) -> bool:
     )
 
 
+def _has_tokenizer_files(model_dir: Path) -> bool:
+    """Return True when a directory has any loadable tokenizer artifact."""
+    return (
+        (model_dir / "tokenizer.json").exists()
+        or (model_dir / "tokenizer_config.json").exists()
+        or (model_dir / "tokenizer.model").exists()
+    )
+
+
 def _detect_training_output_type(model_dir: Path) -> Optional[str]:
-    """Classify a Studio training output as LoRA or full finetune."""
+    """Classify a Studio training output as LoRA or full finetune.
+
+    For merged/full-finetune outputs, require a tokenizer file in
+    addition to config.json and weights. Studio training writes
+    ``save_model()`` before ``tokenizer.save_pretrained(output_dir)``,
+    so without this guard the scan can list a merged run during the
+    finalize window when the tokenizer files are still missing and the
+    checkpoint cannot be loaded yet.
+    """
     if _looks_like_lora_adapter(model_dir):
         return "lora"
 
     config_file = model_dir / "config.json"
-    if config_file.exists() and _has_model_weight_files(model_dir):
+    if (
+        config_file.exists()
+        and _has_tokenizer_files(model_dir)
+        and _has_model_weight_files(model_dir)
+    ):
         return "merged"
 
     return None
+
+
+def _parse_unsloth_dir_name(dir_name: str) -> Optional[str]:
+    """Extract a base model from an ``unsloth_<model>_<timestamp>`` dir name.
+
+    Returns ``None`` for names that have no non-empty model segment
+    (e.g. ``unsloth_1775545843`` with no model part, or ``unsloth__<ts>``
+    where the model segment is empty). Studio always appends a 9+ digit
+    Unix timestamp, so any real Studio-produced directory has at least
+    three underscore-delimited parts.
+    """
+    if not dir_name.startswith("unsloth_"):
+        return None
+    parts = dir_name.split("_")
+    if len(parts) < 3:
+        return None
+    model_parts = [p for p in parts[1:-1] if p]
+    if not model_parts:
+        return None
+    return "unsloth/" + "_".join(model_parts)
 
 
 def scan_trained_models(
@@ -1389,7 +1430,7 @@ def scan_trained_models(
     outputs_path = resolve_output_dir(outputs_dir)
 
     if not outputs_path.exists():
-        logger.warning(f"Outputs directory not found: {outputs_dir}")
+        logger.warning("Outputs directory not found: %s", outputs_dir)
         return trained_models
 
     try:
@@ -1433,7 +1474,7 @@ def scan_trained_models(
         return trained_models
 
     except Exception as e:
-        logger.error(f"Error scanning outputs folder: {e}")
+        logger.error("Error scanning outputs folder: %s", e)
         # Return any entries already collected so a single late failure
         # does not wipe the whole scan result.
         return trained_models
@@ -1575,13 +1616,23 @@ def scan_exported_models(
                 results.append((display_name, model_path, export_type, base_model))
                 logger.debug(f"Found exported model: {display_name} ({export_type})")
 
-        results.sort(key = lambda x: Path(x[1]).stat().st_mtime, reverse = True)
-        logger.info(f"Found {len(results)} exported models in {exports_dir}")
+        # Sort by mtime, tolerating races where an export vanished
+        # between enumeration and sort.
+        def _export_mtime(entry: Tuple[str, str, str, Optional[str]]) -> float:
+            try:
+                return Path(entry[1]).stat().st_mtime
+            except OSError:
+                return 0.0
+
+        results.sort(key = _export_mtime, reverse = True)
+        logger.info("Found %s exported models in %s", len(results), exports_dir)
         return results
 
     except Exception as e:
-        logger.error(f"Error scanning exports folder: {e}")
-        return []
+        logger.error("Error scanning exports folder: %s", e)
+        # Return any entries already collected rather than wiping the
+        # whole scan on a late failure.
+        return results
 
 
 def _same_checkpoint_path(candidate: str, checkpoint_path_obj: Path) -> bool:
@@ -1639,19 +1690,12 @@ def get_base_model_from_checkpoint(checkpoint_path: str) -> Optional[str]:
         # from files on disk. adapter_config.json and config.json above
         # already cover every Studio-produced checkpoint.
 
-        dir_name = checkpoint_path_obj.name
-        if dir_name.startswith("unsloth_"):
-            parts = dir_name.split("_")
-            # Need at least ["unsloth", <model>, <timestamp>] for the
-            # heuristic to produce a non-empty base model name.
-            if len(parts) >= 3:
-                model_parts = [p for p in parts[1:-1] if p]
-                if model_parts:
-                    base_model = "unsloth/" + "_".join(model_parts)
-                    logger.info(
-                        "Detected base model from directory name: %s", base_model
-                    )
-                    return base_model
+        base_model = _parse_unsloth_dir_name(checkpoint_path_obj.name)
+        if base_model:
+            logger.info(
+                "Detected base model from directory name: %s", base_model
+            )
+            return base_model
 
         logger.warning("Could not detect base model for checkpoint: %s", checkpoint_path)
         return None
@@ -1694,21 +1738,14 @@ def get_base_model_from_lora(lora_path: str) -> Optional[str]:
         # from files on disk. adapter_config.json above already covers every
         # Studio-produced LoRA run.
 
-        # Last resort: parse from directory name
+        # Last resort: parse from directory name.
         # Format: unsloth_Meta-Llama-3.1-8B-Instruct-bnb-4bit_timestamp
-        dir_name = lora_path_obj.name
-        if dir_name.startswith("unsloth_"):
-            parts = dir_name.split("_")
-            # Need at least ["unsloth", <model>, <timestamp>] for the
-            # heuristic to produce a non-empty base model name.
-            if len(parts) >= 3:
-                model_parts = [p for p in parts[1:-1] if p]
-                if model_parts:
-                    base_model = "unsloth/" + "_".join(model_parts)
-                    logger.info(
-                        "Detected base model from directory name: %s", base_model
-                    )
-                    return base_model
+        base_model = _parse_unsloth_dir_name(lora_path_obj.name)
+        if base_model:
+            logger.info(
+                "Detected base model from directory name: %s", base_model
+            )
+            return base_model
 
         logger.warning("Could not detect base model for LoRA: %s", lora_path)
         return None
