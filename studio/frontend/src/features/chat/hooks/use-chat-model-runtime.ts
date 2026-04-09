@@ -232,31 +232,8 @@ export function useChatModelRuntime() {
         // Apply inference defaults on reconnect (page refresh with model already loaded)
         if (statusRes.inference) {
           const currentParams = useChatRuntimeStore.getState().params;
-          const reconnectResponse: LoadModelResponse = {
-            status: "already_loaded",
-            model: statusRes.active_model,
-            display_name: statusRes.active_model,
-            is_vision: statusRes.is_vision,
-            is_lora: false,
-            is_gguf: statusRes.is_gguf,
-            is_audio: statusRes.is_audio,
-            audio_type: statusRes.audio_type,
-            has_audio_input: statusRes.has_audio_input,
-            inference: statusRes.inference,
-            context_length: statusRes.context_length,
-            max_context_length: statusRes.max_context_length,
-            native_context_length: statusRes.native_context_length,
-            supports_reasoning: statusRes.supports_reasoning,
-            reasoning_always_on: statusRes.reasoning_always_on,
-            supports_tools: statusRes.supports_tools,
-            speculative_type: statusRes.speculative_type,
-          };
           setParams(
-            mergeRecommendedInference(
-              currentParams,
-              reconnectResponse,
-              statusRes.active_model,
-            ),
+            mergeRecommendedInference(currentParams, statusRes as any, statusRes.active_model),
           );
         }
 
@@ -353,9 +330,8 @@ export function useChatModelRuntime() {
         typeof selection === "string" ? false : selection.isDownloaded ?? false;
       const model = models.find((entry) => entry.id === modelId);
       const lora = loras.find((entry) => entry.id === modelId);
-      const loraIsAdapter = lora?.exportType === "lora";
       const isLora =
-        explicitIsLora ?? model?.isLora ?? loraIsAdapter ?? false;
+        explicitIsLora ?? model?.isLora ?? (lora ? true : false);
       const displayName = model?.name || lora?.name || modelId;
       const currentCheckpoint =
         useChatRuntimeStore.getState().params.checkpoint;
@@ -369,9 +345,9 @@ export function useChatModelRuntime() {
         ? loras.find((entry) => entry.id === previousCheckpoint)
         : undefined;
       const previousIsLora =
-        previousModel?.isLora ?? (previousLora?.exportType === "lora");
+        previousModel?.isLora ?? (previousLora ? true : false);
       // Covers Unix absolute (/), relative (./  ../), tilde (~/), Windows drive (C:\), UNC (\\server)
-      const isLocal = /^(\/|\.{1,2}[\\/]|~[\\/]|[A-Za-z]:[\\/]|\\\\)/.test(modelId);
+      const isLocal = /^(\/|\.{1,2}[\\\/]|~[\\\/]|[A-Za-z]:[\\\/]|\\\\)/.test(modelId);
       const isCachedLora = isLora && isLocal;
       const loadingDescription = [
         currentCheckpoint ? "Switching models." : null,
