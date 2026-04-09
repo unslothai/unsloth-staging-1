@@ -243,10 +243,10 @@ class RawTextDataLoader:
 
 class TextPreprocessor:
     def clean_text(self, text):
-        """Remove unwanted characters, normalize whitespace"""
+        """Remove unwanted characters, normalize whitespace, and preserve paragraph breaks."""
         text = text.replace("\r\n", "\n").replace("\r", "\n")
-        text = re.sub(r"[^\x20-\x7E\n\t]", "", text)
         text = re.sub(r"[^\S\n]+", " ", text)
+        text = re.sub(r"[^\x20-\x7E\n]", "", text)
         text = re.sub(r" *\n *", "\n", text)
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
