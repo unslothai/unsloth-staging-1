@@ -249,6 +249,7 @@ class TextPreprocessor:
         text = re.sub(r"[^\x20-\x7E\n]", "", text)
         text = re.sub(r" *\n *", "\n", text)
         text = re.sub(r"\n{3,}", "\n\n", text)
+        text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)
         return text.strip()
 
     def extract_sections(self, text, patterns):
