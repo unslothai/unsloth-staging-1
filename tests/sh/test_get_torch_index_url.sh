@@ -34,11 +34,18 @@ assert_eq() {
     fi
 }
 
-# Helper: create a mock nvidia-smi that prints a given CUDA version string
+# Helper: create a mock nvidia-smi that:
+#   - returns a GPU name list on `-L` (so _has_usable_nvidia_gpu accepts it)
+#   - returns the CUDA Version banner on the default invocation (so
+#     get_torch_index_url parses the version out of it)
 make_mock_smi() {
     _dir=$(mktemp -d)
     cat > "$_dir/nvidia-smi" <<MOCK
 #!/bin/sh
+if [ "\$1" = "-L" ]; then
+    echo "GPU 0: NVIDIA Test Device (UUID: GPU-00000000-0000-0000-0000-000000000000)"
+    exit 0
+fi
 cat <<'SMI_OUT'
 +-----------------------------------------------------------------------------------------+
 | NVIDIA-SMI 550.54.15              Driver Version: 550.54.15      CUDA Version: $1     |

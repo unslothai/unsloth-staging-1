@@ -982,13 +982,27 @@ _find_no_torch_runtime() {
 # Returns 0 (true) if an actual AMD GPU is present, 1 (false) otherwise.
 # Checks rocminfo for gfx[1-9]* (excludes gfx000 CPU agent) and
 # amd-smi list for GPU data rows (excludes header-only output).
+#
+# Captures stdout before piping to awk so that a non-zero exit from
+# rocminfo / amd-smi cannot be masked by a successful awk match. In
+# POSIX `sh`, the pipeline's return status is the status of the last
+# command, so a pattern like `rocminfo | awk '/gfx[1-9]/'` would return
+# 0 (success) whenever awk matched even if rocminfo itself crashed
+# after printing a stale line first.
 _has_amd_rocm_gpu() {
-    if command -v rocminfo >/dev/null 2>&1 && \
-       rocminfo 2>/dev/null | awk '/Name:[[:space:]]*gfx[1-9]/{found=1} END{exit !found}'; then
-        return 0
-    elif command -v amd-smi >/dev/null 2>&1 && \
-         amd-smi list 2>/dev/null | awk '/^GPU[[:space:]]*[:\[][[:space:]]*[0-9]/{ found=1 } END{ exit !found }'; then
-        return 0
+    if command -v rocminfo >/dev/null 2>&1; then
+        _out=$(rocminfo 2>/dev/null) || _out=""
+        if [ -n "$_out" ] && printf '%s\n' "$_out" \
+            | awk '/Name:[[:space:]]*gfx[1-9]/{found=1} END{exit !found}'; then
+            return 0
+        fi
+    fi
+    if command -v amd-smi >/dev/null 2>&1; then
+        _out=$(amd-smi list 2>/dev/null) || _out=""
+        if [ -n "$_out" ] && printf '%s\n' "$_out" \
+            | awk '/^GPU[[:space:]]*[:\[][[:space:]]*[0-9]/{found=1} END{exit !found}'; then
+            return 0
+        fi
     fi
     return 1
 }
@@ -1001,11 +1015,11 @@ _has_amd_rocm_gpu() {
 # Probe order:
 #   1. `nvidia-smi -L`          (modern, authoritative)
 #   2. `nvidia-smi --query-gpu` (older drivers where -L may be unavailable)
-#   3. banner CUDA Version line (legacy / stripped installs where neither
-#      of the structured commands works but the plain banner is intact)
 #
-# All three must fail before we treat NVIDIA as unavailable, so hosts where
-# `nvidia-smi` works but `-L` is broken are not regressed to CPU wheels.
+# A broken/stale nvidia-smi that fails both structured probes but still
+# prints a banner with ``CUDA Version: X.Y`` is deliberately NOT treated
+# as usable -- on an AMD host that is the same output a dead driver emits,
+# and we want to fall through to the ROCm branch in that case.
 _has_usable_nvidia_gpu() {
     _nvsmi=""
     if command -v nvidia-smi >/dev/null 2>&1; then
@@ -1015,16 +1029,17 @@ _has_usable_nvidia_gpu() {
     else
         return 1
     fi
-    if "$_nvsmi" -L 2>/dev/null \
+    _out=$("$_nvsmi" -L 2>/dev/null) || _out=""
+    if [ -n "$_out" ] && printf '%s\n' "$_out" \
         | awk '/^GPU[[:space:]]+[0-9]+:/{found=1} END{exit !found}'; then
         return 0
     fi
-    if "$_nvsmi" --query-gpu=index --format=csv,noheader 2>/dev/null \
+    _out=$("$_nvsmi" --query-gpu=index --format=csv,noheader 2>/dev/null) || _out=""
+    if [ -n "$_out" ] && printf '%s\n' "$_out" \
         | awk 'NF{found=1} END{exit !found}'; then
         return 0
     fi
-    LC_ALL=C "$_nvsmi" 2>/dev/null \
-        | awk '/CUDA Version:[[:space:]]*[0-9]/{found=1} END{exit !found}'
+    return 1
 }
 
 # ── Detect GPU and choose PyTorch index URL ──
@@ -1103,8 +1118,11 @@ get_torch_index_url() {
             # 6.3, 6.4, 7.0, 7.1, 7.2 (and 5.7 is below our minimum).
             # TODO: uncomment rocm7.2 when the torch upper bound is bumped
             # to >=2.11.0.
+            # _rocm_tag is guaranteed to be exactly "rocmMAJOR.MINOR" by
+            # the validation above, so we do not accept any "rocmX.Y.Z"
+            # wildcards here -- those alternatives would be dead code.
             case "$_rocm_tag" in
-                rocm6.0|rocm6.0.*|rocm6.1|rocm6.1.*|rocm6.2|rocm6.2.*|rocm6.3|rocm6.3.*|rocm6.4|rocm6.4.*|rocm7.0|rocm7.0.*|rocm7.1|rocm7.1.*)
+                rocm6.0|rocm6.1|rocm6.2|rocm6.3|rocm6.4|rocm7.0|rocm7.1)
                     echo "$_base/$_rocm_tag" ;;
                 rocm6.*)
                     # ROCm 6.5+ (no published PyTorch wheels): clip down
@@ -1272,14 +1290,31 @@ _pick_radeon_wheel() {
 
 TORCH_INDEX_URL=$(get_torch_index_url)
 
-# Auto-detect GPU for AMD ROCm based
-# get_torch_index_url must have chosen */rocm*
-# (gfx in rocminfo or amd-smi list). Then require rocminfo "Marketing Name:.*Radeon".
+# Auto-detect GPU for AMD ROCm based -- only evaluated when
+# get_torch_index_url already chose a */rocm* index. Prefer
+# rocminfo "Marketing Name:.*Radeon" but also accept amd-smi
+# static output since package-managed Radeon hosts may ship
+# amd-smi without rocminfo.
+_is_radeon_gpu() {
+    if command -v rocminfo >/dev/null 2>&1; then
+        _out=$(rocminfo 2>/dev/null) || _out=""
+        if [ -n "$_out" ] && printf '%s\n' "$_out" | grep -q 'Marketing Name:.*Radeon'; then
+            return 0
+        fi
+    fi
+    if command -v amd-smi >/dev/null 2>&1; then
+        _out=$(amd-smi static 2>/dev/null) || _out=""
+        if [ -n "$_out" ] && printf '%s\n' "$_out" | grep -qi 'Radeon'; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
 _amd_gpu_radeon=false
 case "$TORCH_INDEX_URL" in
     */rocm*)
-        if _has_amd_rocm_gpu && command -v rocminfo >/dev/null 2>&1 && \
-           rocminfo 2>/dev/null | grep -q 'Marketing Name:.*Radeon'; then
+        if _has_amd_rocm_gpu && _is_radeon_gpu; then
             _amd_gpu_radeon=true
         fi
         ;;

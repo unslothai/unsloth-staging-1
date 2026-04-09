@@ -1366,6 +1366,25 @@ def get_visible_gpu_count() -> int:
     return _visible_gpu_count
 
 
+def _cuda_runtime_present() -> bool:
+    """Return True when torch is importable AND links against CUDA.
+
+    Used by ``apply_gpu_ids`` to decide whether an inherited HIP/ROCR
+    visibility variable is a ROCm signal or a stale mixed-history
+    container artefact. ROCm torch sets ``torch.version.hip`` instead
+    of a real ``torch.version.cuda`` string, so a CUDA build is the
+    signal "this host is NVIDIA, do not rewrite HIP vars".
+    """
+    try:
+        import torch
+    except Exception:
+        return False
+    return (
+        getattr(torch.version, "cuda", None) is not None
+        and getattr(torch.version, "hip", None) is None
+    )
+
+
 def apply_gpu_ids(gpu_ids) -> None:
     if gpu_ids is None:
         return
@@ -1385,17 +1404,30 @@ def apply_gpu_ids(gpu_ids) -> None:
 
     os.environ["CUDA_VISIBLE_DEVICES"] = value
     # Keep ROCm visibility env vars in sync so _get_parent_visible_gpu_spec()
-    # picks up the narrowed set on AMD systems. Only do this when
-    # detect_hardware() has confirmed we are on a ROCm host: otherwise a
-    # mixed-history container that inherits HIP_VISIBLE_DEVICES or
-    # ROCR_VISIBLE_DEVICES as environment defaults (common on multi-tenant
-    # ML clusters that advertise both NVIDIA and AMD wheels) would have
-    # those AMD variables silently rewritten on an NVIDIA-only host.
+    # picks up the narrowed set on AMD systems. Sync when either:
+    #   1. detect_hardware() has confirmed we are on a ROCm host, OR
+    #   2. the parent process already set a ROCm visibility variable AND
+    #      no CUDA Python runtime is importable (NVIDIA never uses HIP
+    #      env vars, so inherited HIP_VISIBLE_DEVICES is a ROCm signal
+    #      unless a CUDA torch is already loaded).
+    # Case 2 covers worker subprocesses that call apply_gpu_ids() before
+    # detect_hardware() runs on AMD hosts where the cluster scheduler
+    # exports HIP_VISIBLE_DEVICES broadly. The CUDA-runtime probe keeps
+    # a mixed-history container with stale AMD env vars from silently
+    # having those vars rewritten on an NVIDIA-only host.
+    _inherits_rocm_visibility = (
+        "HIP_VISIBLE_DEVICES" in os.environ or "ROCR_VISIBLE_DEVICES" in os.environ
+    )
+    _propagate_rocm = False
     if IS_ROCM:
+        _propagate_rocm = True
+    elif _inherits_rocm_visibility and not _cuda_runtime_present():
+        _propagate_rocm = True
+    if _propagate_rocm:
         os.environ["HIP_VISIBLE_DEVICES"] = value
         os.environ["ROCR_VISIBLE_DEVICES"] = value
     _visible_gpu_count = None
-    if IS_ROCM:
+    if _propagate_rocm:
         logger.info("Applied gpu_ids: CUDA_VISIBLE_DEVICES='%s' (rocm)", value)
     else:
         logger.info("Applied gpu_ids: CUDA_VISIBLE_DEVICES='%s'", value)

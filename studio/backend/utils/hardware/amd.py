@@ -215,22 +215,48 @@ def _has_real_metrics(metrics: dict[str, Any]) -> bool:
     return any(value is not None for value in metrics.values())
 
 
+def _is_gpu_entry(entry: Any) -> bool:
+    """Return True if an amd-smi list entry describes a GPU.
+
+    ``amd-smi list --json`` can include CPU and other device entries
+    alongside GPUs, so a naive ``len(data)`` inflates the physical GPU
+    count on heterogeneous systems. Use the common dict fields the AMD
+    SMI CLI exposes for GPUs (``gpu`` / ``gpu_id`` / ``device_type`` /
+    ``type``) to distinguish them.
+    """
+    if not isinstance(entry, dict):
+        return False
+    if "gpu" in entry or "gpu_id" in entry:
+        return True
+    device_type = entry.get("device_type")
+    if isinstance(device_type, str) and device_type.lower() == "gpu":
+        return True
+    entry_type = entry.get("type")
+    if isinstance(entry_type, str) and entry_type.lower() == "gpu":
+        return True
+    return False
+
+
 def get_physical_gpu_count() -> Optional[int]:
     """Return physical AMD GPU count via amd-smi, or None on failure."""
     data = _run_amd_smi("list")
     if data is None:
         return None
     if isinstance(data, list):
-        return len(data)
+        return sum(1 for entry in data if _is_gpu_entry(entry))
     # Some versions return a dict with a "gpu" / "gpus" key. Guard the
     # .get() access with an isinstance check so a malformed scalar /
     # string response from amd-smi cannot raise AttributeError.
     if not isinstance(data, dict):
         return None
-    gpus = data.get("gpu", data.get("gpus", []))
+    gpus = data.get("gpus", data.get("gpu"))
     if isinstance(gpus, list):
-        return len(gpus)
-    return None
+        return sum(1 for entry in gpus if _is_gpu_entry(entry))
+    if isinstance(gpus, dict):
+        return sum(1 for entry in gpus.values() if isinstance(entry, dict))
+    # Final fallback: treat the top-level payload itself as a single GPU
+    # envelope if it looks like one.
+    return 1 if _is_gpu_entry(data) else None
 
 
 def _first_visible_amd_gpu_id() -> Optional[str]:

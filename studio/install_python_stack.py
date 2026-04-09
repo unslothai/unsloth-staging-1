@@ -179,17 +179,85 @@ def _has_rocm_gpu() -> bool:
     return False
 
 
+def _has_radeon_gpu() -> bool:
+    """Return True when a consumer AMD Radeon GPU is detected.
+
+    Mirrors the `_is_radeon_gpu` shell helper in install.sh: prefer the
+    rocminfo ``Marketing Name`` line, fall back to ``amd-smi static``.
+    """
+    import re as _re_radeon
+
+    rocminfo = shutil.which("rocminfo")
+    if rocminfo:
+        try:
+            result = subprocess.run(
+                [rocminfo],
+                stdout = subprocess.PIPE,
+                stderr = subprocess.DEVNULL,
+                text = True,
+                timeout = 10,
+            )
+        except Exception:
+            result = None
+        if (
+            result is not None
+            and result.returncode == 0
+            and _re_radeon.search(r"(?m)^\s*Marketing Name:.*Radeon", result.stdout)
+        ):
+            return True
+    amd_smi = shutil.which("amd-smi")
+    if amd_smi:
+        try:
+            result = subprocess.run(
+                [amd_smi, "static"],
+                stdout = subprocess.PIPE,
+                stderr = subprocess.DEVNULL,
+                text = True,
+                timeout = 10,
+            )
+        except Exception:
+            result = None
+        if (
+            result is not None
+            and result.returncode == 0
+            and "radeon" in (result.stdout or "").lower()
+        ):
+            return True
+    return False
+
+
+def _radeon_wheel_index(ver: tuple[int, int]) -> str | None:
+    """Return the Radeon manylinux wheel index URL for the given ROCm
+    version if it is reachable, else None.
+
+    install.sh prefers `repo.radeon.com` wheels on Radeon hosts so the
+    Studio update path should do the same; otherwise a fresh install
+    ends up on Radeon wheels but a subsequent `unsloth studio update`
+    silently overwrites them with the generic PyTorch ROCm wheels.
+    """
+    base = f"https://repo.radeon.com/rocm/manylinux/rocm-rel-{ver[0]}.{ver[1]}/"
+    try:
+        req = urllib.request.Request(base, method = "HEAD")
+        with urllib.request.urlopen(req, timeout = 10):
+            return base
+    except Exception:
+        return None
+
+
 def _has_usable_nvidia_gpu() -> bool:
     """Return True only when nvidia-smi exists AND reports at least one GPU.
 
-    Tries three probes in order so older or stripped nvidia-smi builds that
-    do not support ``-L`` are not misclassified as "no NVIDIA GPU":
+    Tries two structured probes in order so older or stripped nvidia-smi
+    builds that do not support ``-L`` are not misclassified as "no NVIDIA
+    GPU":
 
       1. ``nvidia-smi -L``
       2. ``nvidia-smi --query-gpu=index --format=csv,noheader``
-      3. Banner ``CUDA Version: ...`` line from the plain command
 
-    Only after all three fail do we fall through to AMD ROCm detection.
+    A broken/stale ``nvidia-smi`` that fails both structured probes but
+    still prints a banner with ``CUDA Version: X.Y`` is deliberately NOT
+    treated as usable: on an AMD host that is the same output a dead
+    driver emits, and we want to fall through to the ROCm branch.
     """
     exe = shutil.which("nvidia-smi")
     if not exe:
@@ -212,23 +280,7 @@ def _has_usable_nvidia_gpu() -> bool:
             line.strip() for line in result.stdout.splitlines()
         ):
             return True
-    # Final fallback: plain banner with a "CUDA Version" line is still a
-    # strong signal on stripped installs where the structured queries fail.
-    try:
-        banner = subprocess.run(
-            [exe],
-            stdout = subprocess.PIPE,
-            stderr = subprocess.DEVNULL,
-            text = True,
-            timeout = 10,
-        )
-    except Exception:
-        return False
-    if banner.returncode != 0:
-        return False
-    import re as _re_nv
-
-    return bool(_re_nv.search(r"CUDA Version:\s*\d", banner.stdout))
+    return False
 
 
 def _ensure_rocm_torch() -> None:
@@ -293,35 +345,60 @@ def _ensure_rocm_torch() -> None:
     rocm_torch_ready = has_hip_torch
 
     if not has_hip_torch:
-        # Select best matching wheel tag (newest ROCm version <= installed)
-        tag = next(
-            (
-                t
-                for (maj, mn), t in sorted(_ROCM_TORCH_INDEX.items(), reverse = True)
-                if ver >= (maj, mn)
-            ),
-            None,
-        )
-        if tag is None:
+        # On consumer Radeon hosts prefer the AMD-published
+        # repo.radeon.com wheel set when it is reachable. This mirrors
+        # the fresh-install path in install.sh so `unsloth studio
+        # update` does not silently overwrite Radeon torch with the
+        # generic PyTorch ROCm wheels.
+        radeon_links: str | None = None
+        if _has_radeon_gpu():
+            radeon_links = _radeon_wheel_index(ver)
+        if radeon_links is not None:
             print(
-                f"   No PyTorch wheel for ROCm {ver[0]}.{ver[1]} -- "
-                f"skipping torch reinstall"
+                f"   Radeon ROCm {ver[0]}.{ver[1]} -- installing torch from {radeon_links}"
             )
-        else:
-            index_url = f"{_PYTORCH_WHL_BASE}/{tag}"
-            print(f"   ROCm {ver[0]}.{ver[1]} -- installing torch from {index_url}")
             pip_install(
-                f"ROCm torch ({tag})",
+                f"ROCm torch (Radeon {ver[0]}.{ver[1]})",
                 "--force-reinstall",
                 "--no-cache-dir",
-                "torch>=2.4,<2.11.0",
-                "torchvision<0.26.0",
-                "torchaudio<2.11.0",
-                "--index-url",
-                index_url,
+                "--find-links",
+                radeon_links,
+                "torch",
+                "torchvision",
+                "torchaudio",
                 constrain = False,
             )
             rocm_torch_ready = True
+        else:
+            # Select best matching wheel tag (newest ROCm version <= installed)
+            tag = next(
+                (
+                    t
+                    for (maj, mn), t in sorted(_ROCM_TORCH_INDEX.items(), reverse = True)
+                    if ver >= (maj, mn)
+                ),
+                None,
+            )
+            if tag is None:
+                print(
+                    f"   No PyTorch wheel for ROCm {ver[0]}.{ver[1]} -- "
+                    f"skipping torch reinstall"
+                )
+            else:
+                index_url = f"{_PYTORCH_WHL_BASE}/{tag}"
+                print(f"   ROCm {ver[0]}.{ver[1]} -- installing torch from {index_url}")
+                pip_install(
+                    f"ROCm torch ({tag})",
+                    "--force-reinstall",
+                    "--no-cache-dir",
+                    "torch>=2.4,<2.11.0",
+                    "torchvision<0.26.0",
+                    "torchaudio<2.11.0",
+                    "--index-url",
+                    index_url,
+                    constrain = False,
+                )
+                rocm_torch_ready = True
 
     # Install bitsandbytes only when the venv has a ROCm-compatible torch
     # (either already present or just installed). Avoids leaving an AMD
