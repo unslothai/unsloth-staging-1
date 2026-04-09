@@ -1103,6 +1103,8 @@ def patch_sft_trainer_tokenizer():
             "    a = np.array([int(x.decode('utf-8'))/1024 for x in a])\n"
             "except:\n"
             "    if not torch.cuda.is_available():\n"
+            "        if hasattr(torch, 'xpu') and torch.xpu.is_available():\n"
+            "            raise RuntimeError('Unsloth: Intel GPU (XPU) is not yet supported for this training path.')\n"
             "        raise RuntimeError('Unsloth: No GPU detected. AMD ROCm users: install ROCm-enabled PyTorch -- see https://docs.unsloth.ai/get-started/install-and-update/amd')\n"
             "    # nvidia-smi unavailable but torch.cuda IS available -- we are on\n"
             "    # a ROCm host (ROCm reuses the torch.cuda.* API surface, so\n"

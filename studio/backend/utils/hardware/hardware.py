@@ -1385,20 +1385,17 @@ def apply_gpu_ids(gpu_ids) -> None:
 
     os.environ["CUDA_VISIBLE_DEVICES"] = value
     # Keep ROCm visibility env vars in sync so _get_parent_visible_gpu_spec()
-    # picks up the narrowed set on AMD systems. Workers can call
-    # apply_gpu_ids() before detect_hardware() runs (so IS_ROCM is still
-    # its default False), so also mirror the selection whenever the
-    # parent process already set a ROCm visibility variable -- that
-    # way a downstream ROCm process inherits the narrowed mask even
-    # before Studio's hardware detection has classified the host.
-    _inherits_rocm_visibility = (
-        "HIP_VISIBLE_DEVICES" in os.environ or "ROCR_VISIBLE_DEVICES" in os.environ
-    )
-    if IS_ROCM or _inherits_rocm_visibility:
+    # picks up the narrowed set on AMD systems. Only do this when
+    # detect_hardware() has confirmed we are on a ROCm host: otherwise a
+    # mixed-history container that inherits HIP_VISIBLE_DEVICES or
+    # ROCR_VISIBLE_DEVICES as environment defaults (common on multi-tenant
+    # ML clusters that advertise both NVIDIA and AMD wheels) would have
+    # those AMD variables silently rewritten on an NVIDIA-only host.
+    if IS_ROCM:
         os.environ["HIP_VISIBLE_DEVICES"] = value
         os.environ["ROCR_VISIBLE_DEVICES"] = value
     _visible_gpu_count = None
-    if IS_ROCM or _inherits_rocm_visibility:
+    if IS_ROCM:
         logger.info("Applied gpu_ids: CUDA_VISIBLE_DEVICES='%s' (rocm)", value)
     else:
         logger.info("Applied gpu_ids: CUDA_VISIBLE_DEVICES='%s'", value)

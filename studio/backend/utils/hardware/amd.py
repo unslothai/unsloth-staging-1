@@ -43,7 +43,12 @@ def _run_amd_smi(*args: str, timeout: int = 5) -> Optional[Any]:
 
 
 def _parse_numeric(value: Any) -> Optional[float]:
-    """Extract a numeric value from amd-smi output (may be str, int, float, or dict)."""
+    """Extract a numeric value from amd-smi output (may be str, int, float, or dict).
+
+    Negative and non-finite values are rejected so a corrupt amd-smi
+    reading cannot surface as (for example) a negative VRAM figure in
+    the UI, which would also poison downstream percentage calculations.
+    """
     if value is None:
         return None
     # Newer amd-smi versions emit {"value": 10, "unit": "W"}
@@ -51,16 +56,21 @@ def _parse_numeric(value: Any) -> Optional[float]:
         return _parse_numeric(value.get("value"))
     if isinstance(value, (int, float)):
         f = float(value)
-        return f if math.isfinite(f) else None
+        if not math.isfinite(f) or f < 0:
+            return None
+        return f
     if isinstance(value, str):
         # Strip units like "W", "C", "%", "MB", "MiB", "GB", "GiB" etc.
         cleaned = re.sub(r"\s*[A-Za-z/%]+$", "", value.strip())
         if not cleaned or cleaned.lower() in ("n/a", "none", "unknown"):
             return None
         try:
-            return float(cleaned)
+            f = float(cleaned)
         except (ValueError, TypeError):
             return None
+        if not math.isfinite(f) or f < 0:
+            return None
+        return f
     return None
 
 

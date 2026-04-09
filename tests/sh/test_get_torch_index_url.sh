@@ -7,14 +7,18 @@ INSTALL_SH="$SCRIPT_DIR/../../install.sh"
 PASS=0
 FAIL=0
 
-# Extract only the get_torch_index_url function from install.sh
-# Also replace the hardcoded /usr/bin/nvidia-smi fallback with a
-# controllable path so we can test the "no GPU" scenario on GPU machines.
+# Extract the ROCm/NVIDIA detection helpers AND get_torch_index_url from
+# install.sh into a single sourced file. Also replace the hardcoded
+# /usr/bin/nvidia-smi fallback with a controllable path so we can test
+# the "no GPU" scenario on GPU machines.
 _FUNC_FILE=$(mktemp)
 _FAKE_SMI_DIR=$(mktemp -d)
-sed -n '/^get_torch_index_url()/,/^}/p' "$INSTALL_SH" \
-    | sed "s|/usr/bin/nvidia-smi|$_FAKE_SMI_DIR/nvidia-smi-absent|g" \
-    > "$_FUNC_FILE"
+{
+    sed -n '/^_has_amd_rocm_gpu()/,/^}/p' "$INSTALL_SH"
+    sed -n '/^_has_usable_nvidia_gpu()/,/^}/p' "$INSTALL_SH"
+    sed -n '/^get_torch_index_url()/,/^}/p' "$INSTALL_SH"
+} | sed "s|/usr/bin/nvidia-smi|$_FAKE_SMI_DIR/nvidia-smi-absent|g" \
+  > "$_FUNC_FILE"
 
 # Save system PATH so we always have basic tools (uname, grep, head, etc.)
 _SYS_PATH="/usr/local/bin:/usr/bin:/bin"
@@ -46,9 +50,10 @@ MOCK
 }
 
 # Build a minimal tools directory with symlinks to essential commands
-# (uname, grep, head, etc.) but WITHOUT nvidia-smi.
+# (uname, grep, head, awk, etc.) but WITHOUT nvidia-smi. awk is required
+# by the new _has_usable_nvidia_gpu detection pipeline.
 _TOOLS_DIR=$(mktemp -d)
-for _cmd in uname grep sed head sh bash cat; do
+for _cmd in uname grep sed head awk sh bash cat; do
     _real=$(command -v "$_cmd" 2>/dev/null || true)
     [ -n "$_real" ] && ln -sf "$_real" "$_TOOLS_DIR/$_cmd"
 done

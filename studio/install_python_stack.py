@@ -83,7 +83,11 @@ def _detect_rocm_version() -> tuple[int, int] | None:
         except Exception:
             pass
 
-    # Try hipconfig --version (outputs bare version like "6.3.21234.2")
+    # Try hipconfig --version (outputs bare version like "6.3.21234.2").
+    # Use text=True for consistency with every other subprocess call in
+    # this file and with _detect_host_rocm_version() in
+    # studio/install_llama_prebuilt.py; a manual .decode() can raise on
+    # non-UTF-8 builds and would not report any stderr.
     hipconfig = shutil.which("hipconfig")
     if hipconfig:
         try:
@@ -91,10 +95,11 @@ def _detect_rocm_version() -> tuple[int, int] | None:
                 [hipconfig, "--version"],
                 stdout = subprocess.PIPE,
                 stderr = subprocess.DEVNULL,
+                text = True,
                 timeout = 5,
             )
             if result.returncode == 0:
-                raw = result.stdout.decode().strip().split("\n")[0]
+                raw = (result.stdout or "").strip().split("\n")[0]
                 parts = raw.split(".")
                 if (
                     len(parts) >= 2
@@ -175,13 +180,43 @@ def _has_rocm_gpu() -> bool:
 
 
 def _has_usable_nvidia_gpu() -> bool:
-    """Return True only when nvidia-smi exists AND reports at least one GPU."""
+    """Return True only when nvidia-smi exists AND reports at least one GPU.
+
+    Tries three probes in order so older or stripped nvidia-smi builds that
+    do not support ``-L`` are not misclassified as "no NVIDIA GPU":
+
+      1. ``nvidia-smi -L``
+      2. ``nvidia-smi --query-gpu=index --format=csv,noheader``
+      3. Banner ``CUDA Version: ...`` line from the plain command
+
+    Only after all three fail do we fall through to AMD ROCm detection.
+    """
     exe = shutil.which("nvidia-smi")
     if not exe:
         return False
+    for cmd in (
+        [exe, "-L"],
+        [exe, "--query-gpu=index", "--format=csv,noheader"],
+    ):
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout = subprocess.PIPE,
+                stderr = subprocess.DEVNULL,
+                text = True,
+                timeout = 10,
+            )
+        except Exception:
+            continue
+        if result.returncode == 0 and any(
+            line.strip() for line in result.stdout.splitlines()
+        ):
+            return True
+    # Final fallback: plain banner with a "CUDA Version" line is still a
+    # strong signal on stripped installs where the structured queries fail.
     try:
-        result = subprocess.run(
-            [exe, "-L"],
+        banner = subprocess.run(
+            [exe],
             stdout = subprocess.PIPE,
             stderr = subprocess.DEVNULL,
             text = True,
@@ -189,7 +224,11 @@ def _has_usable_nvidia_gpu() -> bool:
         )
     except Exception:
         return False
-    return result.returncode == 0 and "GPU " in result.stdout
+    if banner.returncode != 0:
+        return False
+    import re as _re_nv
+
+    return bool(_re_nv.search(r"CUDA Version:\s*\d", banner.stdout))
 
 
 def _ensure_rocm_torch() -> None:

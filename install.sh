@@ -994,9 +994,18 @@ _has_amd_rocm_gpu() {
 }
 
 # ── NVIDIA usable-GPU helper ──
-# Returns 0 (true) only if nvidia-smi is present AND actually lists a GPU.
+# Returns 0 (true) only if nvidia-smi is present AND actually reports a GPU.
 # Prevents AMD-only hosts with a stale nvidia-smi on PATH from being routed
 # into the CUDA branch.
+#
+# Probe order:
+#   1. `nvidia-smi -L`          (modern, authoritative)
+#   2. `nvidia-smi --query-gpu` (older drivers where -L may be unavailable)
+#   3. banner CUDA Version line (legacy / stripped installs where neither
+#      of the structured commands works but the plain banner is intact)
+#
+# All three must fail before we treat NVIDIA as unavailable, so hosts where
+# `nvidia-smi` works but `-L` is broken are not regressed to CPU wheels.
 _has_usable_nvidia_gpu() {
     _nvsmi=""
     if command -v nvidia-smi >/dev/null 2>&1; then
@@ -1006,7 +1015,16 @@ _has_usable_nvidia_gpu() {
     else
         return 1
     fi
-    "$_nvsmi" -L 2>/dev/null | awk '/^GPU[[:space:]]+[0-9]+:/{found=1} END{exit !found}'
+    if "$_nvsmi" -L 2>/dev/null \
+        | awk '/^GPU[[:space:]]+[0-9]+:/{found=1} END{exit !found}'; then
+        return 0
+    fi
+    if "$_nvsmi" --query-gpu=index --format=csv,noheader 2>/dev/null \
+        | awk 'NF{found=1} END{exit !found}'; then
+        return 0
+    fi
+    LC_ALL=C "$_nvsmi" 2>/dev/null \
+        | awk '/CUDA Version:[[:space:]]*[0-9]/{found=1} END{exit !found}'
 }
 
 # ── Detect GPU and choose PyTorch index URL ──
@@ -1058,10 +1076,17 @@ get_torch_index_url() {
                 ver="$(rpm -q --qf '%{VERSION}\n' rocm-core 2>/dev/null)" && \
                 [ -n "$ver" ] && \
                 printf '%s\n' "$ver" | awk -F'[.-]' '{print "rocm"$1"."$2; exit}'; }) 2>/dev/null
-        # Validate _rocm_tag: must match "rocmX.Y" with major >= 1
+        # Validate _rocm_tag: must match exactly "rocmMAJOR.MINOR" (major >= 1,
+        # digits only). Use explicit character-class alternatives instead of
+        # relying on the shell wildcard `*`, which would otherwise accept
+        # garbled input like `rocm6.0abc` or `rocm6.0; evil` and turn it into
+        # a bad PyTorch index URL.
         case "$_rocm_tag" in
-            rocm[1-9]*.[0-9]*) : ;;  # valid (major >= 1)
-            *) _rocm_tag="" ;;        # reject malformed (empty, garbled, or major=0)
+            rocm[1-9].[0-9]|\
+            rocm[1-9].[1-9][0-9]|\
+            rocm[1-9][0-9].[0-9]|\
+            rocm[1-9][0-9].[1-9][0-9]) : ;;
+            *) _rocm_tag="" ;;
         esac
         if [ -n "$_rocm_tag" ]; then
             # Minimum supported: ROCm 6.0 (no PyTorch wheels exist for older)
@@ -1119,8 +1144,10 @@ get_radeon_wheel_url() {
     # and hipconfig --version can return either shape.
     case "$(uname -s)" in Linux) ;; *) echo ""; return ;; esac
 
-    # Detect ROCm version (X.Y or X.Y.Z) -- try amd-smi, then
-    # /opt/rocm/.info/version, then hipconfig.
+    # Detect ROCm version (X.Y or X.Y.Z) -- mirrors the full chain in
+    # get_torch_index_url so package-managed Radeon hosts without
+    # /opt/rocm/.info/version or hipconfig still get the Radeon-repo path
+    # instead of silently falling back to the generic ROCm index.
     _full_ver=""
     _full_ver=$({ command -v amd-smi >/dev/null 2>&1 && \
         amd-smi version 2>/dev/null | awk -F'ROCm version: ' \
@@ -1128,7 +1155,15 @@ get_radeon_wheel_url() {
         { [ -r /opt/rocm/.info/version ] && \
             awk 'match($0,/[0-9]+\.[0-9]+(\.[0-9]+)?/){print substr($0,RSTART,RLENGTH); found=1; exit} END{exit !found}' /opt/rocm/.info/version; } || \
         { command -v hipconfig >/dev/null 2>&1 && \
-            hipconfig --version 2>/dev/null | awk 'NR==1 && match($0,/[0-9]+\.[0-9]+(\.[0-9]+)?/){print substr($0,RSTART,RLENGTH); found=1} END{exit !found}'; }) 2>/dev/null
+            hipconfig --version 2>/dev/null | awk 'NR==1 && match($0,/[0-9]+\.[0-9]+(\.[0-9]+)?/){print substr($0,RSTART,RLENGTH); found=1} END{exit !found}'; } || \
+        { command -v dpkg-query >/dev/null 2>&1 && \
+            ver="$(dpkg-query -W -f='${Version}\n' rocm-core 2>/dev/null)" && \
+            [ -n "$ver" ] && \
+            printf '%s\n' "$ver" | sed 's/^[0-9]*://' | awk -F'[.-]' '{print $1"."$2; exit}'; } || \
+        { command -v rpm >/dev/null 2>&1 && \
+            ver="$(rpm -q --qf '%{VERSION}\n' rocm-core 2>/dev/null)" && \
+            [ -n "$ver" ] && \
+            printf '%s\n' "$ver" | awk -F'[.-]' '{print $1"."$2; exit}'; }) 2>/dev/null
 
     # Validate: must be X.Y or X.Y.Z with X >= 1
     case "$_full_ver" in
@@ -1155,10 +1190,12 @@ _radeon_fetch_listing() {
 import sys
 print('cp{}{}'.format(sys.version_info.major, sys.version_info.minor))
 " 2>/dev/null) || return 1
+    # Cap the response so an oversized listing cannot exhaust memory during
+    # awk parsing. 10 MiB is well above any realistic directory listing.
     if command -v curl >/dev/null 2>&1; then
-        _RADEON_LISTING=$(curl -fsSL --max-time 20 "$_RADEON_BASE_URL" 2>/dev/null)
+        _RADEON_LISTING=$(curl -fsSL --max-time 20 --max-filesize 10485760 "$_RADEON_BASE_URL" 2>/dev/null)
     elif command -v wget >/dev/null 2>&1; then
-        _RADEON_LISTING=$(wget -qO- --timeout=20 "$_RADEON_BASE_URL" 2>/dev/null)
+        _RADEON_LISTING=$(wget -qO- --timeout=20 --quota=10m "$_RADEON_BASE_URL" 2>/dev/null)
     fi
     [ -n "$_RADEON_LISTING" ] || return 1
 }
@@ -1218,9 +1255,18 @@ _pick_radeon_wheel() {
             }
             END { if (max_url != "") print max_url }')
     [ -z "$_href" ] && return 1
+    # Reject hrefs that would either introduce plaintext transport or be
+    # mis-parsed as command-line flags by uv/pip. We only trust absolute
+    # https:// URLs or relative filenames from the already-trusted listing
+    # base (which is itself required to be https://repo.radeon.com/... by
+    # get_radeon_wheel_url).
     case "$_href" in
-        http*) printf '%s\n' "$_href" ;;
-        *)     printf '%s\n' "${_RADEON_BASE_URL%/}/${_href#/}" ;;
+        https://*)      printf '%s\n' "$_href" ;;
+        http://*)       return 1 ;;
+        -*)             return 1 ;;
+        /*)             printf '%s\n' "${_RADEON_BASE_URL%/}${_href}" ;;
+        *://*)          return 1 ;;
+        *)              printf '%s\n' "${_RADEON_BASE_URL%/}/${_href}" ;;
     esac
 }
 
@@ -1263,6 +1309,23 @@ case "$TORCH_INDEX_URL" in
         ;;
 esac
 
+# ── AMD ROCm bitsandbytes installer ──
+# Shared helper used by both the migrated and fresh install paths so the
+# install command only lives in one place. Gated on SKIP_TORCH so users
+# running with --no-torch on a ROCm host stay in GGUF-only mode rather
+# than pulling in bitsandbytes, which is only useful once torch is
+# present for training.
+_install_rocm_bitsandbytes() {
+    if [ "$SKIP_TORCH" = false ]; then
+        case "$TORCH_INDEX_URL" in
+            */rocm*)
+                substep "installing bitsandbytes for AMD ROCm..."
+                run_install_cmd "install bitsandbytes (AMD)" uv pip install --python "$_VENV_PY" --force-reinstall --no-cache-dir "bitsandbytes>=0.49.1"
+                ;;
+        esac
+    fi
+}
+
 # ── Install unsloth directly into the venv (no activation needed) ──
 _VENV_PY="$VENV_DIR/bin/python"
 if [ "$_MIGRATED" = true ]; then
@@ -1293,14 +1356,7 @@ if [ "$_MIGRATED" = true ]; then
     # AMD ROCm: install bitsandbytes even in migrated environments so
     # existing ROCm installs gain the AMD bitsandbytes build without a
     # fresh reinstall.
-    if [ "$SKIP_TORCH" = false ]; then
-        case "$TORCH_INDEX_URL" in
-            */rocm*)
-                substep "installing bitsandbytes for AMD ROCm..."
-                run_install_cmd "install bitsandbytes (AMD)" uv pip install --python "$_VENV_PY" --force-reinstall --no-cache-dir "bitsandbytes>=0.49.1"
-                ;;
-        esac
-    fi
+    _install_rocm_bitsandbytes
 elif [ -n "$TORCH_INDEX_URL" ]; then
     # Fresh: Step 1 - install torch from explicit index (skip when --no-torch or Intel Mac)
     if [ "$SKIP_TORCH" = true ]; then
@@ -1371,9 +1427,19 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
                     _ta_minor=${_ta_ver#*.}
                     _tv_major=${_tv_ver%%.*}
                     _tv_minor=${_tv_ver#*.}
-                    # torchvision expected minor (e.g. torch 2.9 -> 0.24)
-                    _expected_tv_minor=$((_torch_minor + 15))
-                    if [ "$_torch_major" = "$_ta_major" ] && \
+                    # torchvision expected minor = torch.minor + 15
+                    # (torch 2.4 -> torchvision 0.19, torch 2.9 -> 0.24).
+                    # Guard the arithmetic explicitly: POSIX $(( )) treats
+                    # a non-numeric $_torch_minor as 0 and silently yields
+                    # 15, which would then compare against torchvision 0.15
+                    # and force an incorrect fallback to the generic ROCm
+                    # index on malformed wheel names.
+                    _expected_tv_minor=""
+                    case "$_torch_minor" in
+                        [0-9]|[0-9][0-9]) _expected_tv_minor=$((_torch_minor + 15)) ;;
+                    esac
+                    if [ -n "$_expected_tv_minor" ] && \
+                       [ "$_torch_major" = "$_ta_major" ] && \
                        [ "$_torch_minor" = "$_ta_minor" ] && \
                        [ "$_tv_major" = "0" ] && \
                        [ "$_tv_minor" = "$_expected_tv_minor" ]; then
@@ -1422,17 +1488,7 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
             --index-url "$TORCH_INDEX_URL"
     fi
     # AMD ROCm: install bitsandbytes (once, after torch, for all ROCm paths).
-    # Gate on SKIP_TORCH=false so a user running with --no-torch on a ROCm
-    # host stays in GGUF-only mode rather than pulling in bitsandbytes,
-    # which is only useful once torch is present for training.
-    if [ "$SKIP_TORCH" = false ]; then
-        case "$TORCH_INDEX_URL" in
-            */rocm*)
-                substep "installing bitsandbytes for AMD ROCm..."
-                run_install_cmd "install bitsandbytes (AMD)" uv pip install --python "$_VENV_PY" --force-reinstall --no-cache-dir "bitsandbytes>=0.49.1"
-                ;;
-        esac
-    fi
+    _install_rocm_bitsandbytes
     # Fresh: Step 2 - install unsloth, preserving pre-installed torch
     substep "installing unsloth (this may take a few minutes)..."
     if [ "$SKIP_TORCH" = true ]; then

@@ -260,33 +260,6 @@ def _install_package_wheel_first(
     else:
         _send_status(event_queue, f"Installing {display_name} from PyPI...")
 
-    # Prefer uv for faster dependency resolution when available
-    if shutil.which("uv"):
-        pypi_cmd = [
-            "uv",
-            "pip",
-            "install",
-            "--python",
-            sys.executable,
-            "--no-build-isolation",
-            "--no-deps",
-        ]
-        # Avoid stale cache artifacts from partial HIP source builds
-        if is_hip:
-            pypi_cmd.append("--no-cache")
-        pypi_cmd.append(f"{pypi_name}=={pypi_version}")
-    else:
-        pypi_cmd = [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--no-build-isolation",
-            "--no-deps",
-            "--no-cache-dir",
-            f"{pypi_name}=={pypi_version}",
-        ]
-
     # Source compilation on ROCm can take 10-30 minutes; use a generous
     # timeout. Non-HIP installs preserve the pre-existing "no timeout"
     # behaviour so unrelated slow installs (e.g. causal-conv1d source
@@ -300,6 +273,62 @@ def _install_package_wheel_first(
     if is_hip:
         _run_kwargs["timeout"] = 1800
 
+    # Prefer uv for faster dependency resolution when available, but fall
+    # back to pip on failure so a transient uv resolver error or stale uv
+    # build cache does not block a source install that pip could complete.
+    _uv_result = None
+    if shutil.which("uv"):
+        uv_cmd = [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            sys.executable,
+            "--no-build-isolation",
+            "--no-deps",
+        ]
+        # Avoid stale cache artifacts from partial HIP source builds
+        if is_hip:
+            uv_cmd.append("--no-cache")
+        uv_cmd.append(f"{pypi_name}=={pypi_version}")
+        try:
+            _uv_result = _sp.run(uv_cmd, **_run_kwargs)
+        except _sp.TimeoutExpired:
+            logger.error(
+                "%s uv install timed out after %ds",
+                display_name,
+                _run_kwargs.get("timeout"),
+            )
+            _send_status(
+                event_queue,
+                f"{display_name} installation timed out after "
+                f"{_run_kwargs.get('timeout')}s",
+            )
+            return
+        if _uv_result.returncode == 0:
+            if is_hip:
+                logger.info(
+                    "Compiled and installed %s from source for ROCm", display_name
+                )
+            else:
+                logger.info("Installed %s from PyPI", display_name)
+            return
+        logger.warning(
+            "uv failed to install %s (rc=%d), retrying with pip",
+            display_name,
+            _uv_result.returncode,
+        )
+
+    pypi_cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--no-build-isolation",
+        "--no-deps",
+        "--no-cache-dir",
+        f"{pypi_name}=={pypi_version}",
+    ]
     try:
         result = _sp.run(pypi_cmd, **_run_kwargs)
     except _sp.TimeoutExpired:
