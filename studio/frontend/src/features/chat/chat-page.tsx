@@ -891,12 +891,18 @@ export function ChatPage(): ReactElement {
   // Clear the compare seed after the matching CompareContent has mounted
   // so a future manual compare entry never replays a stale base/fine-tuned
   // pair. The pairId-match gate at the render site already prevents cross
-  // use, but explicit cleanup is safer against future pairId reuse.
+  // use, but explicit cleanup is safer against future pairId reuse. The
+  // ``view.mode === "compare"`` guard is required for TypeScript strict
+  // mode because ``pairId`` does not exist on the single-view variant.
   useEffect(() => {
-    if (pendingCompareSeed && pendingCompareSeed.pairId === view.pairId) {
+    if (
+      pendingCompareSeed &&
+      view.mode === "compare" &&
+      pendingCompareSeed.pairId === view.pairId
+    ) {
       setPendingCompareSeed(null);
     }
-  }, [view.pairId, pendingCompareSeed]);
+  }, [view, pendingCompareSeed]);
 
   const tourSteps = useMemo(
     () =>

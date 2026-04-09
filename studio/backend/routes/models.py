@@ -804,8 +804,12 @@ async def scan_loras(
                 try:
                     if is_embedding_model(base_model):
                         continue
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(
+                        "Could not check embedding status for %s: %s",
+                        base_model,
+                        e,
+                    )
             lora_list.append(
                 LoRAInfo(
                     display_name = display_name,

@@ -2201,7 +2201,7 @@ class ModelConfig:
                     config_path = hf_hub_download(
                         identifier, "adapter_config.json", token = hf_token
                     )
-                    with open(config_path, "r") as f:
+                    with open(config_path, "r", encoding = "utf-8") as f:
                         adapter_config = json.load(f)
                     base_model = adapter_config.get("base_model_name_or_path")
                     if base_model:
