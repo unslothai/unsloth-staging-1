@@ -120,7 +120,13 @@ _result=$(run_func "$_dir")
 assert_eq "CUDA 10.2 -> cpu" "https://download.pytorch.org/whl/cpu" "$_result"
 rm -rf "$_dir"
 
-# 8) Unparseable nvidia-smi output -> cu126 default
+# 8) nvidia-smi binary exists but both structured probes are unusable:
+#    _has_usable_nvidia_gpu requires at least one of `-L` (with a proper
+#    `GPU N:` line) or `--query-gpu=index` (with numeric indices). A
+#    binary that returns garbage for every invocation should be treated
+#    as "no NVIDIA GPU" so an AMD-only host with a stale nvidia-smi
+#    userspace is not silently routed into the CUDA wheel path. Without
+#    an AMD GPU detected either, the result is CPU.
 _dir=$(mktemp -d)
 cat > "$_dir/nvidia-smi" <<'MOCK'
 #!/bin/sh
@@ -128,7 +134,7 @@ echo "something completely unexpected"
 MOCK
 chmod +x "$_dir/nvidia-smi"
 _result=$(run_func "$_dir")
-assert_eq "unparseable -> cu126" "https://download.pytorch.org/whl/cu126" "$_result"
+assert_eq "unparseable -> cpu" "https://download.pytorch.org/whl/cpu" "$_result"
 rm -rf "$_dir"
 
 rm -f "$_FUNC_FILE"

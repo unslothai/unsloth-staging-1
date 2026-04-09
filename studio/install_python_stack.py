@@ -226,22 +226,185 @@ def _has_radeon_gpu() -> bool:
     return False
 
 
-def _radeon_wheel_index(ver: tuple[int, int]) -> str | None:
+def _radeon_fetch_listing(base_url: str) -> str | None:
+    """Fetch the Radeon manylinux directory listing, capped at 10 MiB.
+
+    Returns the HTML body (decoded as UTF-8 with replacement) or None on
+    network / size failure. A response larger than 10 MiB is rejected
+    instead of streamed to prevent a pathological listing from
+    exhausting memory during regex parsing.
+    """
+    try:
+        req = urllib.request.Request(base_url, method = "GET")
+        with urllib.request.urlopen(req, timeout = 20) as response:
+            body = response.read(10 * 1024 * 1024 + 1)
+    except Exception:
+        return None
+    if not body or len(body) > 10 * 1024 * 1024:
+        return None
+    try:
+        return body.decode("utf-8", errors = "replace")
+    except Exception:
+        return None
+
+
+def _pick_radeon_wheel_url(
+    listing: str, base_url: str, package: str, python_tag: str
+) -> str | None:
+    """Pick the newest wheel in ``listing`` for ``package`` + ``python_tag``.
+
+    Mirrors the shell `_pick_radeon_wheel` helper: parse ``href`` values,
+    require an exact ``PACKAGE-`` prefix, a ``-{python_tag}-`` segment,
+    and a linux x86_64 platform suffix. Pads each numeric component of
+    the version for a plain lexical comparison so the newest release
+    wins. Returns a fully-qualified URL (resolving relative hrefs
+    against ``base_url``) or None.
+    """
+    import re as _re_rad
+
+    best_pad: str | None = None
+    best_href: str | None = None
+    prefix = f"{package}-"
+    version_re = _re_rad.compile(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?")
+    for match in _re_rad.finditer(r'href="([^"]+)"', listing):
+        raw_href = match.group(1)
+        base_name = raw_href.rsplit("/", 1)[-1]
+        base_name = _re_rad.sub(r"[?#].*", "", base_name)
+        if not base_name.startswith(prefix):
+            continue
+        if f"-{python_tag}-" not in base_name:
+            continue
+        if not _re_rad.search(r"x86_64\.whl$", base_name):
+            continue
+        ver_match = version_re.search(base_name)
+        if ver_match is None:
+            continue
+        pad = "".join(f"{int(part):08d}" for part in ver_match.group(0).split("."))
+        if best_pad is None or pad > best_pad:
+            best_pad = pad
+            best_href = raw_href
+    if best_href is None:
+        return None
+    # Reject plaintext / flag-injection hrefs; resolve relative paths
+    # against the known-https Radeon base URL.
+    if best_href.startswith("https://"):
+        return best_href
+    if best_href.startswith("http://") or best_href.startswith("-"):
+        return None
+    if "://" in best_href:
+        return None
+    base_stripped = base_url.rstrip("/")
+    if best_href.startswith("/"):
+        return f"{base_stripped}{best_href}"
+    return f"{base_stripped}/{best_href}"
+
+
+def _radeon_wheel_index(ver: str) -> str | None:
     """Return the Radeon manylinux wheel index URL for the given ROCm
-    version if it is reachable, else None.
+    version string (e.g. ``"7.2.1"`` or ``"7.2"``) if it is reachable.
 
     install.sh prefers `repo.radeon.com` wheels on Radeon hosts so the
     Studio update path should do the same; otherwise a fresh install
     ends up on Radeon wheels but a subsequent `unsloth studio update`
     silently overwrites them with the generic PyTorch ROCm wheels.
     """
-    base = f"https://repo.radeon.com/rocm/manylinux/rocm-rel-{ver[0]}.{ver[1]}/"
+    base = f"https://repo.radeon.com/rocm/manylinux/rocm-rel-{ver}/"
     try:
         req = urllib.request.Request(base, method = "HEAD")
         with urllib.request.urlopen(req, timeout = 10):
             return base
     except Exception:
         return None
+
+
+def _detect_rocm_full_version() -> str | None:
+    """Return the host ROCm version as ``"X.Y"`` or ``"X.Y.Z"``.
+
+    Used by the Radeon repo resolver which needs the full patch
+    version (``7.2.1`` vs ``7.2``) to address the correct directory
+    under ``https://repo.radeon.com/rocm/manylinux/``.
+    """
+    import re as _re_full
+
+    rocm_root = os.environ.get("ROCM_PATH") or "/opt/rocm"
+    for path in (
+        os.path.join(rocm_root, ".info", "version"),
+        os.path.join(rocm_root, "lib", "rocm_version"),
+    ):
+        try:
+            with open(path) as fh:
+                raw = fh.read().strip()
+        except Exception:
+            continue
+        m = _re_full.search(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", raw)
+        if m:
+            return m.group(0)
+
+    amd_smi = shutil.which("amd-smi")
+    if amd_smi:
+        try:
+            result = subprocess.run(
+                [amd_smi, "version"],
+                stdout = subprocess.PIPE,
+                stderr = subprocess.DEVNULL,
+                text = True,
+                timeout = 5,
+            )
+        except Exception:
+            result = None
+        if result is not None and result.returncode == 0:
+            m = _re_full.search(
+                r"ROCm version:\s*([0-9]+\.[0-9]+(?:\.[0-9]+)?)", result.stdout
+            )
+            if m:
+                return m.group(1)
+
+    hipconfig = shutil.which("hipconfig")
+    if hipconfig:
+        try:
+            result = subprocess.run(
+                [hipconfig, "--version"],
+                stdout = subprocess.PIPE,
+                stderr = subprocess.DEVNULL,
+                text = True,
+                timeout = 5,
+            )
+        except Exception:
+            result = None
+        if result is not None and result.returncode == 0:
+            m = _re_full.search(
+                r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", (result.stdout or "").split("\n")[0]
+            )
+            if m:
+                return m.group(0)
+
+    for cmd in (
+        ["dpkg-query", "-W", "-f=${Version}\n", "rocm-core"],
+        ["rpm", "-q", "--qf", "%{VERSION}\n", "rocm-core"],
+    ):
+        exe = shutil.which(cmd[0])
+        if not exe:
+            continue
+        try:
+            result = subprocess.run(
+                [exe, *cmd[1:]],
+                stdout = subprocess.PIPE,
+                stderr = subprocess.DEVNULL,
+                text = True,
+                timeout = 5,
+            )
+        except Exception:
+            continue
+        if result.returncode != 0 or not (result.stdout or "").strip():
+            continue
+        raw = result.stdout.strip()
+        # Strip Debian epoch like "1:6.3.0-1ubuntu1"
+        raw = _re_full.sub(r"^[0-9]+:", "", raw)
+        m = _re_full.search(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", raw)
+        if m:
+            return m.group(0)
+
+    return None
 
 
 def _has_usable_nvidia_gpu() -> bool:
@@ -259,28 +422,53 @@ def _has_usable_nvidia_gpu() -> bool:
     treated as usable: on an AMD host that is the same output a dead
     driver emits, and we want to fall through to the ROCm branch.
     """
+    import re as _re_nv
+
     exe = shutil.which("nvidia-smi")
     if not exe:
         return False
-    for cmd in (
-        [exe, "-L"],
-        [exe, "--query-gpu=index", "--format=csv,noheader"],
+
+    # Probe 1: -L must produce at least one "GPU N:" line.
+    try:
+        result = subprocess.run(
+            [exe, "-L"],
+            stdout = subprocess.PIPE,
+            stderr = subprocess.DEVNULL,
+            text = True,
+            timeout = 10,
+        )
+    except Exception:
+        result = None
+    if result is not None and result.returncode == 0 and _re_nv.search(
+        r"(?m)^GPU\s+\d+:", result.stdout or ""
     ):
-        try:
-            result = subprocess.run(
-                cmd,
-                stdout = subprocess.PIPE,
-                stderr = subprocess.DEVNULL,
-                text = True,
-                timeout = 10,
-            )
-        except Exception:
+        return True
+
+    # Probe 2: --query-gpu=index must produce only non-negative integer
+    # indices (optional trailing comma). A stale nvidia-smi that prints
+    # the default banner for the flag it does not understand would
+    # otherwise slip through a looser non-empty check.
+    try:
+        result = subprocess.run(
+            [exe, "--query-gpu=index", "--format=csv,noheader"],
+            stdout = subprocess.PIPE,
+            stderr = subprocess.DEVNULL,
+            text = True,
+            timeout = 10,
+        )
+    except Exception:
+        return False
+    if result.returncode != 0:
+        return False
+    saw_index = False
+    for line in (result.stdout or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
             continue
-        if result.returncode == 0 and any(
-            line.strip() for line in result.stdout.splitlines()
-        ):
-            return True
-    return False
+        if not _re_nv.fullmatch(r"[0-9]+\s*,?", stripped):
+            return False
+        saw_index = True
+    return saw_index
 
 
 def _ensure_rocm_torch() -> None:
@@ -350,26 +538,78 @@ def _ensure_rocm_torch() -> None:
         # the fresh-install path in install.sh so `unsloth studio
         # update` does not silently overwrite Radeon torch with the
         # generic PyTorch ROCm wheels.
-        radeon_links: str | None = None
+        #
+        # Important: we must pass explicit wheel URLs, not bare package
+        # names with `--find-links`. `--find-links` is only an extra
+        # source, so `uv`/`pip` may still resolve `torch` to a newer
+        # PyPI release with a generic CUDA runtime. Parsing the Radeon
+        # listing and picking wheels by CPython tag mirrors the
+        # `_pick_radeon_wheel` helper in install.sh.
+        radeon_installed = False
         if _has_radeon_gpu():
-            radeon_links = _radeon_wheel_index(ver)
-        if radeon_links is not None:
-            print(
-                f"   Radeon ROCm {ver[0]}.{ver[1]} -- installing torch from {radeon_links}"
-            )
-            pip_install(
-                f"ROCm torch (Radeon {ver[0]}.{ver[1]})",
-                "--force-reinstall",
-                "--no-cache-dir",
-                "--find-links",
-                radeon_links,
-                "torch",
-                "torchvision",
-                "torchaudio",
-                constrain = False,
-            )
-            rocm_torch_ready = True
-        else:
+            radeon_full_ver = _detect_rocm_full_version()
+            radeon_base: str | None = None
+            if radeon_full_ver is not None:
+                radeon_base = _radeon_wheel_index(radeon_full_ver)
+                # AMD publishes both ``rocm-rel-X.Y.Z/`` and
+                # ``rocm-rel-X.Y/``; if the full version is not reachable,
+                # try the two-component form before giving up.
+                if radeon_base is None and radeon_full_ver.count(".") >= 2:
+                    radeon_base = _radeon_wheel_index(
+                        ".".join(radeon_full_ver.split(".", 2)[:2])
+                    )
+            if radeon_base is not None:
+                listing = _radeon_fetch_listing(radeon_base)
+                python_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+                torch_whl = (
+                    _pick_radeon_wheel_url(listing, radeon_base, "torch", python_tag)
+                    if listing
+                    else None
+                )
+                tv_whl = (
+                    _pick_radeon_wheel_url(
+                        listing, radeon_base, "torchvision", python_tag
+                    )
+                    if listing
+                    else None
+                )
+                ta_whl = (
+                    _pick_radeon_wheel_url(
+                        listing, radeon_base, "torchaudio", python_tag
+                    )
+                    if listing
+                    else None
+                )
+                tri_whl = (
+                    _pick_radeon_wheel_url(listing, radeon_base, "triton", python_tag)
+                    if listing
+                    else None
+                )
+                if torch_whl and tv_whl and ta_whl:
+                    print(
+                        f"   Radeon ROCm {radeon_full_ver} -- installing torch from "
+                        f"{radeon_base}"
+                    )
+                    pip_args = [
+                        f"ROCm torch (Radeon {radeon_full_ver})",
+                        "--force-reinstall",
+                        "--no-cache-dir",
+                        "--find-links",
+                        radeon_base,
+                    ]
+                    if tri_whl:
+                        pip_args.append(tri_whl)
+                    pip_args.extend([torch_whl, tv_whl, ta_whl])
+                    pip_install(*pip_args, constrain = False)
+                    radeon_installed = True
+                    rocm_torch_ready = True
+                else:
+                    print(
+                        "   Radeon repo listing did not contain a compatible "
+                        f"wheel set for {python_tag}; falling back to generic ROCm "
+                        "index"
+                    )
+        if not radeon_installed:
             # Select best matching wheel tag (newest ROCm version <= installed)
             tag = next(
                 (

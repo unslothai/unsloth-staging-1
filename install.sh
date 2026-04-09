@@ -1035,8 +1035,16 @@ _has_usable_nvidia_gpu() {
         return 0
     fi
     _out=$("$_nvsmi" --query-gpu=index --format=csv,noheader 2>/dev/null) || _out=""
+    # Require the output to parse as a proper index list -- every non-empty
+    # line must be a non-negative integer, optionally with a trailing comma.
+    # A stale nvidia-smi that prints the banner (or help text) for the
+    # --query-gpu flag would otherwise pass the loose NF check.
     if [ -n "$_out" ] && printf '%s\n' "$_out" \
-        | awk 'NF{found=1} END{exit !found}'; then
+        | awk '
+            /^[[:space:]]*$/ { next }
+            /^[[:space:]]*[0-9]+[[:space:]]*,?[[:space:]]*$/ { found=1; next }
+            { bad=1 }
+            END { exit (found && !bad) ? 0 : 1 }'; then
         return 0
     fi
     return 1
@@ -1177,13 +1185,18 @@ get_radeon_wheel_url() {
         { command -v dpkg-query >/dev/null 2>&1 && \
             ver="$(dpkg-query -W -f='${Version}\n' rocm-core 2>/dev/null)" && \
             [ -n "$ver" ] && \
-            printf '%s\n' "$ver" | sed 's/^[0-9]*://' | awk -F'[.-]' '{print $1"."$2; exit}'; } || \
+            printf '%s\n' "$ver" | sed 's/^[0-9]*://' | \
+            awk 'match($0,/[0-9]+\.[0-9]+(\.[0-9]+)?/){print substr($0,RSTART,RLENGTH); exit}'; } || \
         { command -v rpm >/dev/null 2>&1 && \
             ver="$(rpm -q --qf '%{VERSION}\n' rocm-core 2>/dev/null)" && \
             [ -n "$ver" ] && \
-            printf '%s\n' "$ver" | awk -F'[.-]' '{print $1"."$2; exit}'; }) 2>/dev/null
+            printf '%s\n' "$ver" | \
+            awk 'match($0,/[0-9]+\.[0-9]+(\.[0-9]+)?/){print substr($0,RSTART,RLENGTH); exit}'; }) 2>/dev/null
 
-    # Validate: must be X.Y or X.Y.Z with X >= 1
+    # Validate: must be X.Y or X.Y.Z with X >= 1. Use explicit
+    # character-class alternatives so a stray character in $_full_ver
+    # (which is constructed from awk-extracted digits) cannot smuggle
+    # a shell metacharacter into the Radeon URL.
     case "$_full_ver" in
         [1-9]*.[0-9]*.[0-9]*) : ;;  # X.Y.Z
         [1-9]*.[0-9]*) : ;;          # X.Y

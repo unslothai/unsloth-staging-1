@@ -45,15 +45,19 @@ def _run_amd_smi(*args: str, timeout: int = 5) -> Optional[Any]:
 def _parse_numeric(value: Any) -> Optional[float]:
     """Extract a numeric value from amd-smi output (may be str, int, float, or dict).
 
-    Negative and non-finite values are rejected so a corrupt amd-smi
-    reading cannot surface as (for example) a negative VRAM figure in
-    the UI, which would also poison downstream percentage calculations.
+    Booleans, negative values, and non-finite floats are rejected so a
+    corrupt amd-smi reading cannot surface as (for example) a negative
+    VRAM figure in the UI or a boolean flag silently treated as a
+    1 MB measurement. ``bool`` is a subclass of ``int`` in Python so
+    the check must exclude it explicitly.
     """
     if value is None:
         return None
     # Newer amd-smi versions emit {"value": 10, "unit": "W"}
     if isinstance(value, dict):
         return _parse_numeric(value.get("value"))
+    if isinstance(value, bool):
+        return None
     if isinstance(value, (int, float)):
         f = float(value)
         if not math.isfinite(f) or f < 0:
