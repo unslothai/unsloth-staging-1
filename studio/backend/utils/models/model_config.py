@@ -1544,10 +1544,16 @@ def _canonicalize_model_path(path_str: str) -> Optional[Path]:
             root_str = os.path.realpath(os.path.expanduser(str(root)))
         except (OSError, RuntimeError, TypeError, ValueError):
             continue
-        # Explicit string-prefix check against a canonicalized root.
-        # CodeQL recognizes this pattern as a path-injection sanitizer.
-        if resolved_str == root_str or resolved_str.startswith(root_str + os.sep):
-            return Path(resolved_str)
+        # CodeQL-recognized path-injection sanitizer: use os.path.commonpath
+        # equality. If the canonical user path and the canonical root share
+        # a common prefix equal to the root, the user path is a descendant.
+        try:
+            if os.path.commonpath([resolved_str, root_str]) == root_str:
+                return Path(resolved_str)
+        except ValueError:
+            # commonpath raises ValueError for mixed absolute/relative or
+            # cross-drive paths on Windows; try the next root.
+            continue
 
     logger.warning(
         "Rejected model path outside Studio roots: %s (resolved: %s)",
