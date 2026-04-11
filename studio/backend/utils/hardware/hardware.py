@@ -502,6 +502,23 @@ def _resolve_xpu_smi_device_id() -> int:
 
 _XPU_SMI_NA = frozenset(("", "n/a", "na", "-"))
 
+# Cached xpu-smi binary path. _XPU_SMI_PATH_UNSET is a sentinel distinct
+# from None: None means "scanned PATH and not found" while the sentinel
+# means "not scanned yet". Resolved once by _resolve_xpu_smi_binary() so
+# live telemetry polls do not re-scan PATH on every tick.
+_XPU_SMI_PATH_UNSET: Any = object()
+_xpu_smi_binary: Any = _XPU_SMI_PATH_UNSET
+
+
+def _resolve_xpu_smi_binary() -> Optional[str]:
+    """Return cached absolute path to ``xpu-smi`` or None if not on PATH."""
+    global _xpu_smi_binary
+    if _xpu_smi_binary is _XPU_SMI_PATH_UNSET:
+        import shutil as _shutil
+
+        _xpu_smi_binary = _shutil.which("xpu-smi")
+    return _xpu_smi_binary
+
 
 def _parse_xpu_smi_metric(value: str) -> Optional[float]:
     """Return float or None for missing/unknown xpu-smi CSV column values.
@@ -528,12 +545,14 @@ def _get_xpu_utilization() -> Dict[str, Any]:
     dev_idx = _resolve_xpu_smi_device_id()
 
     try:
-        import shutil
         import subprocess
 
         # Skip subprocess entirely when xpu-smi is not on PATH, avoiding
         # a multi-second timeout on systems without the Intel tooling.
-        xpu_smi = shutil.which("xpu-smi")
+        # The binary path is resolved once and cached by
+        # _resolve_xpu_smi_binary() so repeated telemetry polls do not
+        # re-scan PATH on every tick.
+        xpu_smi = _resolve_xpu_smi_binary()
         if xpu_smi is None:
             raise FileNotFoundError("xpu-smi not found")
 
@@ -1503,7 +1522,6 @@ def get_backend_visible_gpu_info() -> Dict[str, Any]:
     device = get_device()
     if device in (DeviceType.CUDA, DeviceType.XPU):
         parent_visible_spec = _get_parent_visible_gpu_spec()
-        parent_visible_ids = get_parent_visible_gpu_ids()
 
         # Honor an explicit "no devices visible" mask (ZE_AFFINITY_MASK=""
         # or CUDA_VISIBLE_DEVICES="" / "-1") by short-circuiting before the
@@ -1521,6 +1539,8 @@ def get_backend_visible_gpu_info() -> Dict[str, Any]:
                 "devices": [],
                 "index_kind": "relative",
             }
+
+        parent_visible_ids = get_parent_visible_gpu_ids()
 
         # Try native SMI tool first (nvidia-smi for NVIDIA, skipped for ROCm)
         if device == DeviceType.CUDA and not IS_ROCM:
@@ -1708,10 +1728,13 @@ def apply_gpu_ids(gpu_ids) -> None:
     # so worker subprocesses are actually restricted to the intended GPU.
     if get_device() == DeviceType.XPU:
         os.environ["ZE_AFFINITY_MASK"] = value
-        # Clear any stale CUDA_VISIBLE_DEVICES the parent may have inherited
-        # so tools that inspect the environment do not show conflicting
-        # pinning state (torch.xpu itself only reads ZE_AFFINITY_MASK).
-        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        # Deliberately leave any inherited CUDA_VISIBLE_DEVICES alone: on
+        # hybrid NVIDIA+Intel hosts the parent may have set
+        # CUDA_VISIBLE_DEVICES="" to disable NVIDIA and force Studio onto
+        # XPU. Popping the variable here would let the worker's follow-up
+        # detect_hardware() call flip back to CUDA. torch.xpu only reads
+        # ZE_AFFINITY_MASK, so an extra CUDA_VISIBLE_DEVICES entry in env
+        # is cosmetically stale but functionally harmless.
         _visible_gpu_count = None
         logger.info("Applied gpu_ids: ZE_AFFINITY_MASK='%s'", value)
         return
@@ -1905,10 +1928,20 @@ def dataset_map_num_proc(desired: Optional[int] = None) -> Optional[int]:
     if get_device() == DeviceType.XPU:
         try:
             import torch
-
-            if hasattr(torch, "xpu") and torch.xpu.is_initialized():
-                return None
         except Exception:
-            return None
+            # No torch means no XPU runtime is active here, so CPU-side
+            # dataset parallelism is still safe.
+            return safe_num_proc(desired)
+
+        xpu = getattr(torch, "xpu", None)
+        is_initialized = getattr(xpu, "is_initialized", None)
+        if callable(is_initialized):
+            try:
+                if is_initialized():
+                    return None
+            except Exception:
+                # Treat a failing probe as "runtime not touched yet" so
+                # pre-init CPU preprocessing can still parallelize.
+                pass
 
     return safe_num_proc(desired)
