@@ -222,14 +222,14 @@ def studio_default(
                     )
                     typer.echo(
                         "Check the error above. If a package is missing, "
-                        "re-run: unsloth studio setup",
+                        "re-run: unsloth studio update",
                         err = True,
                     )
                 raise typer.Exit(rc)
             else:
                 os.execvp(str(studio_python), args)
         else:
-            typer.echo("Studio not set up. Run install.sh first.")
+            typer.echo("Studio not set up. Run 'unsloth studio update' first.")
             raise typer.Exit(1)
 
     from studio.backend.run import run_server
@@ -344,6 +344,10 @@ def _run_setup_script(*, verbose: bool = False) -> None:
     # If the script lives inside the studio venv (e.g. installed into
     # site-packages), `studio update` is about to recreate that venv and
     # would delete the script mid-run. Stage a copy in a tempdir first.
+    # Pre-bind so the finally cleanup block cannot hit NameError if
+    # _stage_setup_script_if_needed itself raises (e.g. shutil.copytree
+    # failure) before returning.
+    _staging_tmp: Optional[tempfile.TemporaryDirectory] = None
     script, _staging_tmp = _stage_setup_script_if_needed(script)
 
     env = {**os.environ, "UNSLOTH_VERBOSE": "1"} if verbose else None

@@ -38,13 +38,22 @@ def inference(
     load_in_4bit: bool = typer.Option(True, "--load-in-4bit/--no-load-in-4bit"),
 ):
     """Run a single inference using the specified model."""
-    _reexec_cli_in_studio_venv(sys.argv[1:])
     from typer.models import OptionInfo
 
     if isinstance(system_prompt, OptionInfo):
         system_prompt = ""
 
-    from studio.backend.core import ModelConfig, get_inference_backend
+    # Prefer the current interpreter for editable/dev installs where the
+    # backend is already importable. Only fall back to the Studio-venv
+    # re-exec when the backend import actually fails (the original
+    # "ModuleNotFoundError: No module named 'loggers'" path on thin CLI
+    # installs). Widen the catch to ImportError so a half-installed
+    # backend also routes to the fallback instead of tracing out.
+    try:
+        from studio.backend.core import ModelConfig, get_inference_backend
+    except (ModuleNotFoundError, ImportError):
+        _reexec_cli_in_studio_venv(sys.argv[1:])
+        from studio.backend.core import ModelConfig, get_inference_backend
 
     inference_backend = get_inference_backend()
     try:

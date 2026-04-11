@@ -62,9 +62,6 @@ def train(
         typer.echo(yaml.dump(data, default_flow_style = False, sort_keys = False))
         raise typer.Exit(code = 0)
 
-    # Only re-exec into studio venv for actual training (not dry-run)
-    _reexec_cli_in_studio_venv(sys.argv[1:])
-
     if not cfg.model:
         typer.echo("Error: provide --model or set model in --config", err = True)
         raise typer.Exit(code = 2)
@@ -93,7 +90,15 @@ def train(
         )
         raise typer.Exit(code = 2)
 
-    from studio.backend.core.training.trainer import UnslothTrainer
+    # Editable/dev installs can already import UnslothTrainer directly. Only
+    # fall back to the Studio-venv re-exec when the backend import fails
+    # (e.g. thin CLI install missing the studio/backend path for bare
+    # `from loggers import ...` imports).
+    try:
+        from studio.backend.core.training.trainer import UnslothTrainer
+    except (ModuleNotFoundError, ImportError):
+        _reexec_cli_in_studio_venv(sys.argv[1:])
+        from studio.backend.core.training.trainer import UnslothTrainer
 
     trainer = UnslothTrainer()
 

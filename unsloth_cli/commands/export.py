@@ -27,7 +27,7 @@ def list_checkpoints(
     # case for thin CLI installs.
     try:
         from studio.backend.core.export import ExportBackend
-    except ModuleNotFoundError:
+    except (ModuleNotFoundError, ImportError):
         _reexec_cli_in_studio_venv(sys.argv[1:])
         from studio.backend.core.export import ExportBackend
 
@@ -91,7 +91,7 @@ def export(
     # backend import actually fails.
     try:
         from studio.backend.core.export import ExportBackend
-    except ModuleNotFoundError:
+    except (ModuleNotFoundError, ImportError):
         _reexec_cli_in_studio_venv(sys.argv[1:])
         from studio.backend.core.export import ExportBackend
 
