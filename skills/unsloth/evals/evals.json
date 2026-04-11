@@ -63,7 +63,7 @@
       "expectations": [
         "Uses the PowerShell one-liner: irm https://unsloth.ai/install.ps1 | iex",
         "The install completes successfully (Python, uv, unsloth, and studio dependencies all finish)",
-        "Activates the venv after install: .\\unsloth_studio\\Scripts\\activate",
+        "Activates the venv after install using the Studio Activate.ps1 script (e.g. `& \"$env:USERPROFILE\\.unsloth\\studio\\unsloth_studio\\Scripts\\Activate.ps1\"`)",
         "Verifies the CLI works (e.g. unsloth --help)",
         "No unnecessary exploration before installing"
       ],

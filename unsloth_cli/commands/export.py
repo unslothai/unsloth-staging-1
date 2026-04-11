@@ -20,8 +20,16 @@ def list_checkpoints(
     ),
 ):
     """List checkpoints detected in the outputs directory."""
-    _reexec_cli_in_studio_venv(sys.argv[1:])
-    from studio.backend.core.export import ExportBackend
+    # Prefer the current interpreter when the backend is already importable
+    # (covers editable/dev installs that do not have the Studio venv set
+    # up). Fall back to the Studio-venv re-exec only when the import fails,
+    # which is the original "ModuleNotFoundError: No module named 'loggers'"
+    # case for thin CLI installs.
+    try:
+        from studio.backend.core.export import ExportBackend
+    except ModuleNotFoundError:
+        _reexec_cli_in_studio_venv(sys.argv[1:])
+        from studio.backend.core.export import ExportBackend
 
     backend = ExportBackend()
     checkpoints = backend.scan_checkpoints(outputs_dir = str(outputs_dir))
@@ -78,9 +86,14 @@ def export(
         typer.echo("Error: --repo-id required when using --push-to-hub", err = True)
         raise typer.Exit(code = 2)
 
-    _reexec_cli_in_studio_venv(sys.argv[1:])
-
-    from studio.backend.core.export import ExportBackend
+    # Same dev-install fallback as list_checkpoints: try the current
+    # interpreter first, only re-exec into the Studio venv when the
+    # backend import actually fails.
+    try:
+        from studio.backend.core.export import ExportBackend
+    except ModuleNotFoundError:
+        _reexec_cli_in_studio_venv(sys.argv[1:])
+        from studio.backend.core.export import ExportBackend
 
     backend = ExportBackend()
 

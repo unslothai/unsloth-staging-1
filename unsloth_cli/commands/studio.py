@@ -99,14 +99,10 @@ def _stage_setup_script_if_needed(
 def _in_studio_venv() -> bool:
     """Return True when the current Python already points at the Studio venv."""
     studio_venv_dir = (STUDIO_HOME / "unsloth_studio").resolve()
-    try:
-        return Path(sys.prefix).resolve().is_relative_to(studio_venv_dir)
-    except AttributeError:
-        # Python < 3.9 fallback: compare with explicit separator so a
-        # sibling venv like unsloth_studio_dev does not false-match.
-        prefix = str(Path(sys.prefix).resolve())
-        root = str(studio_venv_dir)
-        return prefix == root or prefix.startswith(root + os.sep)
+    # pyproject.toml pins Python >= 3.9, so Path.is_relative_to is always
+    # available. Using it avoids the string-prefix false-positive where a
+    # sibling venv like unsloth_studio_dev would match the studio path.
+    return Path(sys.prefix).resolve().is_relative_to(studio_venv_dir)
 
 
 def _reexec_cli_in_studio_venv(command_args: list[str], silent: bool = False) -> None:
@@ -126,7 +122,7 @@ def _reexec_cli_in_studio_venv(command_args: list[str], silent: bool = False) ->
 
     studio_python = _studio_venv_python()
     if not studio_python:
-        typer.echo("Studio not set up. Run 'unsloth studio setup' first.")
+        typer.echo("Studio not set up. Run 'unsloth studio update' first.")
         raise typer.Exit(1)
 
     # Propagate studio/backend onto PYTHONPATH so the re-exec'd process can
@@ -211,8 +207,14 @@ def studio_default(
                 try:
                     rc = proc.wait()
                 except KeyboardInterrupt:
-                    # Child has its own signal handler — let it finish
-                    rc = proc.wait()
+                    # Child has its own signal handler — give it a bounded
+                    # window to finish, then force-terminate so the parent
+                    # CLI cannot hang forever on an unresponsive child.
+                    try:
+                        rc = proc.wait(timeout = 10)
+                    except _sp.TimeoutExpired:
+                        proc.terminate()
+                        rc = proc.wait()
                 if rc != 0:
                     typer.echo(
                         f"\nError: Studio server exited unexpectedly (code {rc}).",
@@ -346,6 +348,9 @@ def _run_setup_script(*, verbose: bool = False) -> None:
 
     env = {**os.environ, "UNSLOTH_VERBOSE": "1"} if verbose else None
 
+    # Pre-bind so the cleanup/returncode check cannot hit UnboundLocalError
+    # even if subprocess.run itself raises (FileNotFoundError, OSError, ...).
+    result: Optional[subprocess.CompletedProcess] = None
     try:
         if platform.system() == "Windows":
             result = subprocess.run(
@@ -361,7 +366,7 @@ def _run_setup_script(*, verbose: bool = False) -> None:
         if _staging_tmp is not None:
             _staging_tmp.cleanup()
 
-    if result.returncode != 0:
+    if result is not None and result.returncode != 0:
         raise typer.Exit(result.returncode)
 
 

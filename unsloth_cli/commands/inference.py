@@ -47,11 +47,18 @@ def inference(
     from studio.backend.core import ModelConfig, get_inference_backend
 
     inference_backend = get_inference_backend()
-    model_config = ModelConfig.from_identifier(
-        model_id = model,
-        hf_token = hf_token,
-        is_lora = False,
-    )
+    try:
+        model_config = ModelConfig.from_identifier(
+            model_id = model,
+            hf_token = hf_token,
+            is_lora = False,
+        )
+    except RuntimeError as exc:
+        # ModelConfig.from_identifier raises RuntimeError for cases like a
+        # missing llama-server binary. Surface it as a clean CLI error
+        # instead of a Python traceback.
+        typer.echo(f"Error: {exc}", err = True)
+        raise typer.Exit(code = 1) from exc
     if not model_config:
         typer.echo("Could not resolve model config", err = True)
         raise typer.Exit(code = 1)

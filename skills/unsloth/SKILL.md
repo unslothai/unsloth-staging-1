@@ -22,13 +22,13 @@ Installs Python, uv, Unsloth, and Studio in one command — everything needed to
 macOS / Linux / WSL:
 ```bash
 curl -fsSL https://unsloth.ai/install.sh | sh
-source unsloth_studio/bin/activate
+source ~/.unsloth/studio/unsloth_studio/bin/activate
 ```
 
 Windows (PowerShell):
 ```powershell
 irm https://unsloth.ai/install.ps1 | iex
-& .\unsloth_studio\Scripts\activate
+& "$env:USERPROFILE\.unsloth\studio\unsloth_studio\Scripts\Activate.ps1"
 ```
 
 ### Developer install (when Python and uv are already available)
