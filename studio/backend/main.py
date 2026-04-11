@@ -121,13 +121,13 @@ async def lifespan(app: FastAPI):
     if storage.ensure_default_admin():
         bootstrap_pw = storage.get_bootstrap_password()
         app.state.bootstrap_password = bootstrap_pw
+
+        bootstrap_path = storage.DB_PATH.parent / ".bootstrap_password"
         print("\n" + "=" * 60)
         print("DEFAULT ADMIN ACCOUNT CREATED")
-        print(
-            "Sign in with the seeded credentials and change the password immediately:\n"
-        )
         print(f"    username: {storage.DEFAULT_ADMIN_USERNAME}")
-        print(f"    password: {bootstrap_pw}\n")
+        print(f"    password saved to: {bootstrap_path}")
+        print("    Open the Studio UI to sign in and change it.")
         print("=" * 60 + "\n")
     else:
         app.state.bootstrap_password = storage.get_bootstrap_password()
@@ -237,6 +237,7 @@ async def get_system_info():
     import platform
     import psutil
     from utils.hardware import get_device
+    from utils.hardware.hardware import _backend_label
 
     visibility_info = get_backend_visible_gpu_info()
     gpu_info = {
@@ -250,7 +251,10 @@ async def get_system_info():
     return {
         "platform": platform.platform(),
         "python_version": platform.python_version(),
-        "device_backend": get_device().value,
+        # Use the centralized _backend_label helper so the /api/system
+        # endpoint reports "rocm" on AMD hosts instead of "cuda", matching
+        # the /api/hardware and /api/gpu-visibility endpoints.
+        "device_backend": _backend_label(get_device()),
         "cpu_count": psutil.cpu_count(),
         "memory": {
             "total_gb": round(memory.total / 1e9, 2),

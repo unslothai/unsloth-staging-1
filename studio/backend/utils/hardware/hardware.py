@@ -43,6 +43,27 @@ class DeviceType(str, Enum):
 
 DEVICE: Optional[DeviceType] = None
 CHAT_ONLY: bool = True  # No CUDA/XPU GPU -> GGUF chat only (Mac, CPU-only, etc.)
+IS_ROCM: bool = (
+    False  # True when running on AMD ROCm (HIP) -- routes GPU monitoring to amd.py
+)
+
+
+def _backend_label(device: DeviceType) -> str:
+    """Return the user-facing backend name for API responses.
+
+    Internally we still represent ROCm hosts as ``DeviceType.CUDA`` because
+    ROCm torch sets ``torch.cuda.is_available() = True`` and reuses the whole
+    ``torch.cuda.*`` API surface, so branching on ``DeviceType`` stays
+    consistent with the rest of the codebase. For the JSON responses served
+    to the Studio frontend and other clients, however, "cuda" is misleading
+    on an AMD machine. This helper swaps the label to ``"rocm"`` when the
+    module-level ``IS_ROCM`` flag is set so the UI can render the correct
+    backend name without every caller having to duplicate the check. XPU
+    and other backends fall through to ``device.value`` unchanged.
+    """
+    if IS_ROCM and device == DeviceType.CUDA:
+        return "rocm"
+    return device.value
 
 
 # ========== Detection ==========
@@ -86,9 +107,11 @@ def detect_hardware() -> DeviceType:
       3. MLX   (Apple Silicon via MLX framework)
       4. CPU   (fallback)
     """
-    global DEVICE, CHAT_ONLY
-    CHAT_ONLY = True  # reset -- only CUDA/XPU sets it to False
+    global DEVICE, CHAT_ONLY, IS_ROCM
+    CHAT_ONLY = True  # reset -- only CUDA/ROCm/XPU sets it to False
+    IS_ROCM = False
 
+    # --- CUDA / ROCm / XPU: try PyTorch ---
     if _has_torch():
         import torch
 
@@ -97,7 +120,16 @@ def detect_hardware() -> DeviceType:
             DEVICE = DeviceType.CUDA
             CHAT_ONLY = False
             device_name = torch.cuda.get_device_properties(0).name
-            print(f"Hardware detected: CUDA — {device_name}")
+
+            # Distinguish AMD ROCm (HIP) from NVIDIA CUDA for display purposes.
+            # DeviceType stays CUDA since torch.cuda.* works on ROCm via HIP.
+            if getattr(torch.version, "hip", None) is not None:
+                IS_ROCM = True
+                print(
+                    f"Hardware detected: ROCm (HIP {torch.version.hip}) -- {device_name}"
+                )
+            else:
+                print(f"Hardware detected: CUDA -- {device_name}")
             return DEVICE
 
         # --- XPU: Intel GPU ---
@@ -184,7 +216,7 @@ def get_gpu_memory_info() -> Dict[str, Any]:
 
             return {
                 "available": True,
-                "backend": device.value,
+                "backend": _backend_label(device),
                 "device": idx,
                 "device_name": props.name,
                 "total_gb": total / (1024**3),
@@ -195,7 +227,11 @@ def get_gpu_memory_info() -> Dict[str, Any]:
             }
         except Exception as e:
             logger.error(f"Error getting CUDA GPU info: {e}")
-            return {"available": False, "backend": device.value, "error": str(e)}
+            return {
+                "available": False,
+                "backend": _backend_label(device),
+                "error": str(e),
+            }
 
     # ---- XPU path (Intel GPU) ----
     if device == DeviceType.XPU:
@@ -211,7 +247,7 @@ def get_gpu_memory_info() -> Dict[str, Any]:
 
             return {
                 "available": True,
-                "backend": device.value,
+                "backend": _backend_label(device),
                 "device": idx,
                 "device_name": props.name,
                 "total_gb": total / (1024**3),
@@ -222,7 +258,11 @@ def get_gpu_memory_info() -> Dict[str, Any]:
             }
         except Exception as e:
             logger.error("Error getting XPU GPU info: %s", e)
-            return {"available": False, "backend": device.value, "error": str(e)}
+            return {
+                "available": False,
+                "backend": _backend_label(device),
+                "error": str(e),
+            }
 
     # ---- MLX path (Apple Silicon) ----
     if device == DeviceType.MLX:
@@ -237,7 +277,7 @@ def get_gpu_memory_info() -> Dict[str, Any]:
 
             return {
                 "available": True,
-                "backend": device.value,
+                "backend": _backend_label(device),
                 "device": 0,
                 "device_name": f"Apple Silicon ({platform.processor() or platform.machine()})",
                 "total_gb": total / (1024**3),
@@ -248,7 +288,11 @@ def get_gpu_memory_info() -> Dict[str, Any]:
             }
         except Exception as e:
             logger.error(f"Error getting MLX GPU info: {e}")
-            return {"available": False, "backend": device.value, "error": str(e)}
+            return {
+                "available": False,
+                "backend": _backend_label(device),
+                "error": str(e),
+            }
 
     # ---- CPU-only ----
     return {"available": False, "backend": "cpu"}
@@ -313,11 +357,12 @@ def get_package_versions() -> Dict[str, Optional[str]]:
         except PackageNotFoundError:
             versions[name] = None
 
-    # CUDA/XPU toolkit version bundled with torch
+    # GPU runtime versions bundled with torch (CUDA, ROCm/HIP, Intel XPU)
     try:
         import torch
 
         versions["cuda"] = getattr(torch.version, "cuda", None)
+        versions["rocm"] = getattr(torch.version, "hip", None)
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             # torch.version.xpu exists on modern torch builds but may be None;
             # fall back to "available" so the UI distinguishes present-but-unknown
@@ -326,6 +371,7 @@ def get_package_versions() -> Dict[str, Optional[str]]:
             versions["xpu"] = xpu_ver if xpu_ver is not None else "available"
     except Exception:
         versions["cuda"] = None
+        versions["rocm"] = None
         versions["xpu"] = None
 
     return versions
@@ -527,6 +573,35 @@ def _get_xpu_utilization() -> Dict[str, Any]:
     }
 
 
+def _smi_query(func_name: str, *args, **kwargs) -> Optional[Dict[str, Any]]:
+    """Run a query against the appropriate SMI backend (amd-smi or nvidia-smi).
+
+    Returns the result dict if available, or None on failure/unavailability.
+    """
+    if IS_ROCM:
+        backend_name = "amd-smi"
+        try:
+            from . import amd as _backend
+        except Exception as e:
+            logger.warning("%s import failed: %s", backend_name, e)
+            return None
+    else:
+        backend_name = "nvidia-smi"
+        try:
+            from . import nvidia as _backend
+        except Exception as e:
+            logger.warning("%s import failed: %s", backend_name, e)
+            return None
+    try:
+        func = getattr(_backend, func_name)
+        result = func(*args, **kwargs)
+        if result.get("available"):
+            return result
+    except Exception as e:
+        logger.warning("%s %s query failed: %s", backend_name, func_name, e)
+    return None
+
+
 def get_gpu_utilization() -> Dict[str, Any]:
     """Return a live snapshot of device utilization information."""
     device = get_device()
@@ -535,21 +610,16 @@ def get_gpu_utilization() -> Dict[str, Any]:
         return _get_xpu_utilization()
 
     if device == DeviceType.CUDA:
-        try:
-            from . import nvidia
-
-            result = nvidia.get_primary_gpu_utilization()
-            if result.get("available"):
-                result["backend"] = device.value
-                return result
-        except Exception as e:
-            logger.warning("nvidia-smi utilization query failed: %s", e)
+        result = _smi_query("get_primary_gpu_utilization")
+        if result is not None:
+            result["backend"] = _backend_label(device)
+            return result
 
     mem = get_gpu_memory_info()
     if device != DeviceType.CPU and mem.get("available"):
         return {
             "available": True,
-            "backend": device.value,
+            "backend": _backend_label(device),
             "gpu_utilization_pct": None,
             "temperature_c": None,
             "vram_used_gb": round(mem.get("allocated_gb", 0), 2),
@@ -560,7 +630,7 @@ def get_gpu_utilization() -> Dict[str, Any]:
             "power_utilization_pct": None,
         }
 
-    return {"available": False, "backend": device.value}
+    return {"available": False, "backend": _backend_label(device)}
 
 
 def get_visible_gpu_utilization() -> Dict[str, Any]:
@@ -568,18 +638,14 @@ def get_visible_gpu_utilization() -> Dict[str, Any]:
 
     if device == DeviceType.CUDA:
         parent_visible_spec = _get_parent_visible_gpu_spec()
-        try:
-            from . import nvidia
-
-            result = nvidia.get_visible_gpu_utilization(
-                parent_visible_spec["numeric_ids"],
-                parent_cuda_visible_devices = parent_visible_spec["raw"],
-            )
-            if result.get("available"):
-                result["backend"] = device.value
-                return result
-        except Exception as e:
-            logger.warning("nvidia-smi visible GPU utilization query failed: %s", e)
+        result = _smi_query(
+            "get_visible_gpu_utilization",
+            parent_visible_spec["numeric_ids"],
+            parent_cuda_visible_devices = parent_visible_spec["raw"],
+        )
+        if result is not None:
+            result["backend"] = _backend_label(device)
+            return result
 
     # Torch-based fallback for CUDA (nvidia-smi unavailable, AMD ROCm) and XPU (Intel)
     if device in (DeviceType.CUDA, DeviceType.XPU):
@@ -618,7 +684,7 @@ def get_visible_gpu_utilization() -> Dict[str, Any]:
                 )
             return {
                 "available": True,
-                "backend": device.value,
+                "backend": _backend_label(device),
                 "parent_visible_gpu_ids": parent_ids,
                 "devices": devices,
                 "index_kind": index_kind,
@@ -629,14 +695,14 @@ def get_visible_gpu_utilization() -> Dict[str, Any]:
         if not mem.get("available"):
             return {
                 "available": False,
-                "backend": device.value,
+                "backend": _backend_label(device),
                 "parent_visible_gpu_ids": [],
                 "devices": [],
                 "index_kind": "relative",
             }
         return {
             "available": True,
-            "backend": device.value,
+            "backend": _backend_label(device),
             "parent_visible_gpu_ids": [0],
             "devices": [
                 {
@@ -658,7 +724,7 @@ def get_visible_gpu_utilization() -> Dict[str, Any]:
 
     return {
         "available": False,
-        "backend": device.value,
+        "backend": _backend_label(device),
         "parent_visible_gpu_ids": [],
         "devices": [],
         "index_kind": "relative",
@@ -727,7 +793,21 @@ def _get_parent_visible_gpu_spec() -> Dict[str, Any]:
             "supports_explicit_gpu_ids": True,
         }
 
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    # ROCm uses HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES in addition to
+    # CUDA_VISIBLE_DEVICES (which HIP also respects).  Check ROCm-specific
+    # env vars first so multi-GPU AMD setups are handled correctly.
+    # Use explicit None checks (not `or`) so empty string "" is honoured
+    # as "no visible GPUs" rather than falling through to CUDA_VISIBLE_DEVICES.
+    cuda_visible = None
+    if IS_ROCM:
+        hip_vis = os.environ.get("HIP_VISIBLE_DEVICES")
+        rocr_vis = os.environ.get("ROCR_VISIBLE_DEVICES")
+        if hip_vis is not None:
+            cuda_visible = hip_vis
+        elif rocr_vis is not None:
+            cuda_visible = rocr_vis
+    if cuda_visible is None:
+        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
 
     if cuda_visible is None:
         return {
@@ -1316,15 +1396,17 @@ def get_physical_gpu_count() -> int:
 
     if device == DeviceType.CUDA:
         try:
-            from . import nvidia
-
-            count = nvidia.get_physical_gpu_count()
+            if IS_ROCM:
+                from . import amd as _smi_mod
+            else:
+                from . import nvidia as _smi_mod
+            count = _smi_mod.get_physical_gpu_count()
             if count is not None:
                 _physical_gpu_count = count
                 return _physical_gpu_count
         except Exception:
             pass
-        # nvidia-smi unavailable or failed — fall back to torch
+        # SMI tool unavailable or failed -- fall back to torch
         count = _torch_get_physical_gpu_count()
         _physical_gpu_count = count if count is not None else 1
         return _physical_gpu_count
@@ -1343,12 +1425,25 @@ def get_physical_gpu_count() -> int:
     return _physical_gpu_count
 
 
+def _backend_visible_devices_env() -> Optional[str]:
+    """Return the raw visibility env string that applies to this backend.
+
+    On ROCm, HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES take precedence
+    over CUDA_VISIBLE_DEVICES; the helper mirrors the resolution logic in
+    ``_get_parent_visible_gpu_spec`` so ``backend_cuda_visible_devices``
+    reports the value that is actually narrowing the visible device set.
+    """
+    if IS_ROCM:
+        return _get_parent_visible_gpu_spec().get("raw")
+    return os.environ.get("CUDA_VISIBLE_DEVICES")
+
+
 def get_backend_visible_gpu_info() -> Dict[str, Any]:
     device = get_device()
     if device in (DeviceType.CUDA, DeviceType.XPU):
         parent_visible_ids = get_parent_visible_gpu_ids()
-        # Try nvidia-smi first (NVIDIA only)
-        if device == DeviceType.CUDA:
+        # Try native SMI tool first (nvidia-smi for NVIDIA, skipped for ROCm)
+        if device == DeviceType.CUDA and not IS_ROCM:
             try:
                 from . import nvidia
 
@@ -1358,7 +1453,7 @@ def get_backend_visible_gpu_info() -> Dict[str, Any]:
                     parent_visible_spec["raw"],
                 )
                 if result.get("available"):
-                    result["backend"] = device.value
+                    result["backend"] = _backend_label(device)
                     return result
             except Exception as e:
                 logger.warning("Backend GPU visibility query failed: %s", e)
@@ -1387,8 +1482,8 @@ def get_backend_visible_gpu_info() -> Dict[str, Any]:
             ]
             return {
                 "available": True,
-                "backend": device.value,
-                "backend_cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+                "backend": _backend_label(device),
+                "backend_cuda_visible_devices": _backend_visible_devices_env(),
                 "parent_visible_gpu_ids": parent_visible_ids,
                 "devices": devices,
                 "index_kind": index_kind,
@@ -1396,8 +1491,8 @@ def get_backend_visible_gpu_info() -> Dict[str, Any]:
 
         return {
             "available": False,
-            "backend": device.value,
-            "backend_cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "backend": _backend_label(device),
+            "backend_cuda_visible_devices": _backend_visible_devices_env(),
             "parent_visible_gpu_ids": parent_visible_ids,
             "devices": [],
             "index_kind": "physical",
@@ -1408,7 +1503,7 @@ def get_backend_visible_gpu_info() -> Dict[str, Any]:
         if not mem.get("available"):
             return {
                 "available": False,
-                "backend": device.value,
+                "backend": _backend_label(device),
                 "backend_cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
                 "parent_visible_gpu_ids": [],
                 "devices": [],
@@ -1416,7 +1511,7 @@ def get_backend_visible_gpu_info() -> Dict[str, Any]:
             }
         return {
             "available": True,
-            "backend": device.value,
+            "backend": _backend_label(device),
             "backend_cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
             "parent_visible_gpu_ids": [0],
             "devices": [
@@ -1433,7 +1528,7 @@ def get_backend_visible_gpu_info() -> Dict[str, Any]:
 
     return {
         "available": False,
-        "backend": device.value,
+        "backend": _backend_label(device),
         "backend_cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "parent_visible_gpu_ids": [],
         "devices": [],
@@ -1453,9 +1548,11 @@ def get_visible_gpu_count() -> int:
     if _visible_gpu_count is not None:
         return _visible_gpu_count
 
-    # Check XPU visibility env var
+    # Prefer torch.xpu.device_count() on Intel XPU hosts because the Level
+    # Zero runtime correctly interprets ZE_AFFINITY_MASK semantics (including
+    # subdevice syntax like "0.0,0.1", where two logical devices collapse
+    # onto a single root GPU).
     device = get_device()
-
     if device == DeviceType.XPU:
         xpu_mask_raw = os.environ.get("ZE_AFFINITY_MASK")
         xpu_mask_set = xpu_mask_raw is not None
@@ -1464,8 +1561,6 @@ def get_visible_gpu_count() -> int:
             _visible_gpu_count = 0
             return _visible_gpu_count
 
-        # Prefer torch.xpu.device_count() as it correctly interprets
-        # ZE_AFFINITY_MASK including subdevice syntax (e.g. "0.0,0.1").
         try:
             import torch
 
@@ -1487,17 +1582,21 @@ def get_visible_gpu_count() -> int:
                 _visible_gpu_count = get_physical_gpu_count()
         return _visible_gpu_count
 
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if cuda_visible is not None:
-        # "" means zero GPUs, "0" means 1, "0,1,2" means 3
-        cuda_visible = cuda_visible.strip()
-        if cuda_visible == "" or cuda_visible == "-1":
+    # Use _get_parent_visible_gpu_spec() which already handles
+    # HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES on ROCm and
+    # CUDA_VISIBLE_DEVICES everywhere else.
+    visible_spec = _get_parent_visible_gpu_spec()
+    if visible_spec["raw"] is not None:
+        raw = visible_spec["raw"].strip()
+        if raw == "" or raw == "-1":
             _visible_gpu_count = 0
+        elif visible_spec["numeric_ids"] is not None:
+            _visible_gpu_count = len(visible_spec["numeric_ids"])
         else:
-            _visible_gpu_count = len([x for x in cuda_visible.split(",") if x.strip()])
+            _visible_gpu_count = len([x for x in raw.split(",") if x.strip()])
         return _visible_gpu_count
 
-    # CUDA_VISIBLE_DEVICES not set -- try torch, fall back to physical count
+    # No visibility env var set -- try torch, fall back to physical count
     try:
         import torch
 
@@ -1535,8 +1634,24 @@ def apply_gpu_ids(gpu_ids) -> None:
         return
 
     os.environ["CUDA_VISIBLE_DEVICES"] = value
+    # Keep ROCm visibility env vars in sync so _get_parent_visible_gpu_spec()
+    # picks up the narrowed set on AMD systems. Workers can call
+    # apply_gpu_ids() before detect_hardware() runs (so IS_ROCM is still
+    # its default False), so also mirror the selection whenever the
+    # parent process already set a ROCm visibility variable -- that
+    # way a downstream ROCm process inherits the narrowed mask even
+    # before Studio's hardware detection has classified the host.
+    _inherits_rocm_visibility = (
+        "HIP_VISIBLE_DEVICES" in os.environ or "ROCR_VISIBLE_DEVICES" in os.environ
+    )
+    if IS_ROCM or _inherits_rocm_visibility:
+        os.environ["HIP_VISIBLE_DEVICES"] = value
+        os.environ["ROCR_VISIBLE_DEVICES"] = value
     _visible_gpu_count = None
-    logger.info("Applied gpu_ids: CUDA_VISIBLE_DEVICES='%s'", value)
+    if IS_ROCM or _inherits_rocm_visibility:
+        logger.info("Applied gpu_ids: CUDA_VISIBLE_DEVICES='%s' (rocm)", value)
+    else:
+        logger.info("Applied gpu_ids: CUDA_VISIBLE_DEVICES='%s'", value)
 
 
 def get_device_map(
