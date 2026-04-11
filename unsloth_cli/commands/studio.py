@@ -98,8 +98,15 @@ def _stage_setup_script_if_needed(
 
 def _in_studio_venv() -> bool:
     """Return True when the current Python already points at the Studio venv."""
-    studio_venv_dir = STUDIO_HOME / "unsloth_studio"
-    return sys.prefix.startswith(str(studio_venv_dir))
+    studio_venv_dir = (STUDIO_HOME / "unsloth_studio").resolve()
+    try:
+        return Path(sys.prefix).resolve().is_relative_to(studio_venv_dir)
+    except AttributeError:
+        # Python < 3.9 fallback: compare with explicit separator so a
+        # sibling venv like unsloth_studio_dev does not false-match.
+        prefix = str(Path(sys.prefix).resolve())
+        root = str(studio_venv_dir)
+        return prefix == root or prefix.startswith(root + os.sep)
 
 
 def _reexec_cli_in_studio_venv(command_args: list[str], silent: bool = False) -> None:
@@ -143,7 +150,13 @@ def _reexec_cli_in_studio_venv(command_args: list[str], silent: bool = False) ->
         try:
             rc = proc.wait()
         except KeyboardInterrupt:
-            rc = proc.wait()
+            # Give the child a bounded window to shut down cleanly, then
+            # force-terminate so the parent CLI does not hang forever.
+            try:
+                rc = proc.wait(timeout = 10)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                rc = proc.wait()
         raise typer.Exit(rc)
     else:
         if not silent:
@@ -326,15 +339,27 @@ def _run_setup_script(*, verbose: bool = False) -> None:
         typer.echo("Error: Could not find setup script (setup.sh / setup.ps1).")
         raise typer.Exit(1)
 
+    # If the script lives inside the studio venv (e.g. installed into
+    # site-packages), `studio update` is about to recreate that venv and
+    # would delete the script mid-run. Stage a copy in a tempdir first.
+    script, _staging_tmp = _stage_setup_script_if_needed(script)
+
     env = {**os.environ, "UNSLOTH_VERBOSE": "1"} if verbose else None
 
-    if platform.system() == "Windows":
-        result = subprocess.run(
-            ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(script)],
-            env = env,
-        )
-    else:
-        result = subprocess.run(["bash", str(script)], env = env)
+    try:
+        if platform.system() == "Windows":
+            result = subprocess.run(
+                ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+                env = env,
+            )
+        else:
+            result = subprocess.run(["bash", str(script)], env = env)
+    finally:
+        # Keep the TemporaryDirectory alive until the subprocess finishes,
+        # then clean it up explicitly so the tempdir does not outlive this
+        # function via garbage collection.
+        if _staging_tmp is not None:
+            _staging_tmp.cleanup()
 
     if result.returncode != 0:
         raise typer.Exit(result.returncode)

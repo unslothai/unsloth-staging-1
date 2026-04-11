@@ -71,7 +71,8 @@ def train(
 
     if not cfg.data.dataset and not cfg.data.local_dataset:
         typer.echo(
-            "Error: provide --dataset or --local-dataset (or via --config)", err = True
+            "Error: provide --dataset (or set local_dataset as a list in --config)",
+            err = True,
         )
         raise typer.Exit(code = 2)
 

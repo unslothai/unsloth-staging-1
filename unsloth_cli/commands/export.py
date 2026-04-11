@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import sys
 from pathlib import Path
 from typing import Optional
 
 import typer
+
+from unsloth_cli.commands.studio import _reexec_cli_in_studio_venv
 
 
 EXPORT_FORMATS = ["merged-16bit", "merged-4bit", "gguf", "lora"]
@@ -17,6 +20,7 @@ def list_checkpoints(
     ),
 ):
     """List checkpoints detected in the outputs directory."""
+    _reexec_cli_in_studio_venv(sys.argv[1:])
     from studio.backend.core.export import ExportBackend
 
     backend = ExportBackend()
@@ -73,6 +77,8 @@ def export(
     if push_to_hub and not repo_id:
         typer.echo("Error: --repo-id required when using --push-to-hub", err = True)
         raise typer.Exit(code = 2)
+
+    _reexec_cli_in_studio_venv(sys.argv[1:])
 
     from studio.backend.core.export import ExportBackend
 

@@ -56,9 +56,11 @@ def inference(
         typer.echo("Could not resolve model config", err = True)
         raise typer.Exit(code = 1)
 
-    messages = _build_messages(prompt, system_prompt)
-
     if model_config.is_gguf:
+        # llama.cpp backend does not prepend system_prompt separately, so
+        # include it directly in the chat messages.
+        messages = _build_messages(prompt, system_prompt)
+
         from studio.backend.core.inference.llama_cpp import LlamaCppBackend
 
         gguf_backend = LlamaCppBackend()
@@ -84,6 +86,12 @@ def inference(
             repetition_penalty = repetition_penalty,
         )
     else:
+        # InferenceBackend.generate_chat_response already prepends a
+        # {"role": "system", "content": system_prompt} entry before applying
+        # the chat template, so pass user-only messages to avoid duplicating
+        # the system prompt.
+        messages = [{"role": "user", "content": prompt}]
+
         if not inference_backend.load_model(
             config = model_config,
             max_seq_length = max_seq_length,
@@ -106,6 +114,11 @@ def inference(
     typer.echo("Assistant:", nl = True)
     previous = ""
     for chunk in stream:
+        # llama.cpp yields a trailing {"type": "metadata", ...} dict with
+        # usage and timings after the cumulative text chunks. Skip it so
+        # the output loop only slices strings.
+        if not isinstance(chunk, str):
+            continue
         delta = chunk[len(previous) :]
         if delta:
             sys.stdout.write(delta)

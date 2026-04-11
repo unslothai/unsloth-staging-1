@@ -91,8 +91,9 @@ def run_claude(
         platform = _detect_platform(),
         gpu = _detect_gpu(),
     )
-    # Don't tell fresh-install evals that unsloth is already set up
-    if eval_id != "setup-fresh":
+    # Don't tell fresh-install evals that unsloth is already set up.
+    # Covers setup-fresh, setup-fresh-docker, setup-fresh-windows, etc.
+    if not eval_id.startswith("setup-fresh"):
         ctx += "\n" + ENV_CONTEXT_INSTALLED
     full_prompt = f"{prompt}\n\n{ctx}"
 
@@ -248,6 +249,8 @@ Grade each expectation as passed/failed for BOTH runs. Use this exact JSON forma
 
 Output ONLY the JSON, nothing else."""
 
+    # Grading is pure text-in, text-out — omit --allowedTools so claude
+    # does not expose any tools to the grader at all.
     cmd = [
         "claude",
         "-p",
@@ -258,8 +261,6 @@ Output ONLY the JSON, nothing else."""
         model,
         "--no-session-persistence",
         "--dangerously-skip-permissions",
-        "--tools",
-        "",  # no tools needed for grading
     ]
 
     print(f"  Grading {eval_id}...")
