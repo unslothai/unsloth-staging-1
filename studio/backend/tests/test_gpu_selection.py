@@ -102,7 +102,8 @@ class TestResolveRequestedGpuIds(_GpuCacheResetMixin, unittest.TestCase):
             patch("utils.hardware.hardware.get_physical_gpu_count", return_value = 8),
         ):
             with self.assertRaisesRegex(
-                ValueError, "unsupported when CUDA_VISIBLE_DEVICES uses UUID/MIG"
+                ValueError,
+                "unsupported when CUDA_VISIBLE_DEVICES uses non-numeric or subdevice",
             ):
                 resolve_requested_gpu_ids([1])
 

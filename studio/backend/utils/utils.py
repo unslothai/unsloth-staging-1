@@ -13,8 +13,6 @@ from pathlib import Path
 import shutil
 import tempfile
 
-from utils.hardware import get_device
-
 
 logger = get_logger(__name__)
 
@@ -113,6 +111,11 @@ def format_error_message(error: Exception, model_name: str) -> str:
         or isinstance(error, MemoryError)
         or ("mlx" in error_str and ("memory" in error_str or "allocate" in error_str))
     ):
+        # Resolve get_device() at call time (not import time) so tests that
+        # monkey-patch utils.hardware.get_device after this module is loaded
+        # still see the patched backend.
+        from utils.hardware import get_device
+
         device = get_device()
         device_label = {
             "cuda": "GPU",

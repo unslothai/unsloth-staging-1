@@ -500,6 +500,25 @@ def _resolve_xpu_smi_device_id() -> int:
     return ordinal if xpu_ok else 0
 
 
+_XPU_SMI_NA = frozenset(("", "n/a", "na", "-"))
+
+
+def _parse_xpu_smi_metric(value: str) -> Optional[float]:
+    """Return float or None for missing/unknown xpu-smi CSV column values.
+
+    xpu-smi versions differ slightly in how they render unknown metrics:
+    empty string, "N/A", "n/a", "NA", or "-". Treat any of these as "value
+    not available" so a single missing column does not silently drop the
+    entire telemetry row.
+    """
+    if value.strip().lower() in _XPU_SMI_NA:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
 def _get_xpu_utilization() -> Dict[str, Any]:
     """Return a live snapshot of Intel XPU GPU utilization via ``xpu-smi`` or torch.xpu."""
     gpu_util = None
@@ -532,27 +551,15 @@ def _get_xpu_utilization() -> Dict[str, Any]:
             timeout = 3,
         )
         if result.returncode == 0 and result.stdout.strip():
-            # xpu-smi versions differ slightly in how they render unknown
-            # metrics: empty string, "N/A", "n/a", "NA", or "-". Treat any
-            # of these as "value not available" so a single missing column
-            # does not silently drop the entire telemetry row.
-            _NA = frozenset(("", "n/a", "na", "-"))
-            def _parse_metric(value: str) -> Optional[float]:
-                if value.strip().lower() in _NA:
-                    return None
-                try:
-                    return float(value)
-                except ValueError:
-                    return None
             lines = result.stdout.strip().splitlines()
             for line in reversed(lines):
                 if line.startswith("Timestamp") or line.startswith("#"):
                     continue
                 parts = [p.strip() for p in line.split(",")]
                 if len(parts) >= 5:
-                    gpu_util = _parse_metric(parts[2])
-                    power_w = _parse_metric(parts[3])
-                    temp = _parse_metric(parts[4])
+                    gpu_util = _parse_xpu_smi_metric(parts[2])
+                    power_w = _parse_xpu_smi_metric(parts[3])
+                    temp = _parse_xpu_smi_metric(parts[4])
                     break
     except Exception:
         pass
@@ -579,7 +586,9 @@ def _get_xpu_utilization() -> Dict[str, Any]:
         else None
     )
 
-    has_any = any(v is not None for v in [gpu_util, temp, vram_used_gb])
+    has_any = any(
+        v is not None for v in [gpu_util, temp, vram_used_gb, power_w]
+    )
     if not has_any:
         return {"available": False, "backend": "xpu"}
 
@@ -673,6 +682,23 @@ def get_visible_gpu_utilization() -> Dict[str, Any]:
 
     # Torch-based fallback for CUDA (nvidia-smi unavailable, AMD ROCm) and XPU (Intel)
     if device in (DeviceType.CUDA, DeviceType.XPU):
+        parent_visible_spec = _get_parent_visible_gpu_spec()
+        # Honor an explicit empty visibility env (ZE_AFFINITY_MASK="" or
+        # CUDA_VISIBLE_DEVICES="" / "-1") as "no devices visible". Without
+        # this guard, the enumerate-visible-ordinals fallback below would
+        # happily report devices the process explicitly hid.
+        if (
+            parent_visible_spec["raw"] is not None
+            and parent_visible_spec["numeric_ids"] == []
+        ):
+            return {
+                "available": False,
+                "backend": _backend_label(device),
+                "parent_visible_gpu_ids": [],
+                "devices": [],
+                "index_kind": "relative",
+            }
+
         parent_ids = get_parent_visible_gpu_ids()
         # When parent_visible_ids is empty (UUID/MIG mask or no CVD set),
         # enumerate torch-visible ordinals so the UI still shows devices.
@@ -1476,13 +1502,31 @@ def _backend_visible_devices_env() -> Optional[str]:
 def get_backend_visible_gpu_info() -> Dict[str, Any]:
     device = get_device()
     if device in (DeviceType.CUDA, DeviceType.XPU):
+        parent_visible_spec = _get_parent_visible_gpu_spec()
         parent_visible_ids = get_parent_visible_gpu_ids()
+
+        # Honor an explicit "no devices visible" mask (ZE_AFFINITY_MASK=""
+        # or CUDA_VISIBLE_DEVICES="" / "-1") by short-circuiting before the
+        # torch-ordinal enumeration fallback, which would otherwise report
+        # devices that the process explicitly hid.
+        if (
+            parent_visible_spec["raw"] is not None
+            and parent_visible_spec["numeric_ids"] == []
+        ):
+            return {
+                "available": False,
+                "backend": _backend_label(device),
+                "backend_cuda_visible_devices": _backend_visible_devices_env(),
+                "parent_visible_gpu_ids": [],
+                "devices": [],
+                "index_kind": "relative",
+            }
+
         # Try native SMI tool first (nvidia-smi for NVIDIA, skipped for ROCm)
         if device == DeviceType.CUDA and not IS_ROCM:
             try:
                 from . import nvidia
 
-                parent_visible_spec = _get_parent_visible_gpu_spec()
                 result = nvidia.get_backend_visible_gpu_info(
                     parent_visible_spec["numeric_ids"],
                     parent_visible_spec["raw"],
