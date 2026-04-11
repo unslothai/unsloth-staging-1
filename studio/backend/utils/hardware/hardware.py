@@ -185,10 +185,19 @@ def clear_gpu_cache():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
     elif device == DeviceType.XPU:
-        import torch
+        # Older torch-xpu builds may be missing synchronize/empty_cache;
+        # guard the calls so a stale build does not propagate AttributeError
+        # through callers that do not wrap clear_gpu_cache() themselves.
+        try:
+            import torch
 
-        torch.xpu.synchronize()
-        torch.xpu.empty_cache()
+            if hasattr(torch, "xpu"):
+                if hasattr(torch.xpu, "synchronize"):
+                    torch.xpu.synchronize()
+                if hasattr(torch.xpu, "empty_cache"):
+                    torch.xpu.empty_cache()
+        except Exception:
+            pass
     elif device == DeviceType.MLX:
         # MLX manages memory automatically; no explicit cache clear needed.
         # mlx.core has no empty_cache equivalent — gc.collect() above is enough.
@@ -455,7 +464,10 @@ def _parse_ze_mask_roots(mask: str) -> list[int]:
         if not token:
             continue
         root = token.split(".", 1)[0]
-        if root.isdigit():
+        # Use str.isdecimal() (not str.isdigit()) so Unicode superscripts
+        # like "2" / "3" are rejected -- they satisfy isdigit() but crash
+        # int() with ValueError.
+        if root.isdecimal():
             roots.append(int(root))
     return roots
 
@@ -520,15 +532,27 @@ def _get_xpu_utilization() -> Dict[str, Any]:
             timeout = 3,
         )
         if result.returncode == 0 and result.stdout.strip():
+            # xpu-smi versions differ slightly in how they render unknown
+            # metrics: empty string, "N/A", "n/a", "NA", or "-". Treat any
+            # of these as "value not available" so a single missing column
+            # does not silently drop the entire telemetry row.
+            _NA = frozenset(("", "n/a", "na", "-"))
+            def _parse_metric(value: str) -> Optional[float]:
+                if value.strip().lower() in _NA:
+                    return None
+                try:
+                    return float(value)
+                except ValueError:
+                    return None
             lines = result.stdout.strip().splitlines()
             for line in reversed(lines):
                 if line.startswith("Timestamp") or line.startswith("#"):
                     continue
                 parts = [p.strip() for p in line.split(",")]
                 if len(parts) >= 5:
-                    gpu_util = float(parts[2]) if parts[2] not in ("", "N/A") else None
-                    power_w = float(parts[3]) if parts[3] not in ("", "N/A") else None
-                    temp = float(parts[4]) if parts[4] not in ("", "N/A") else None
+                    gpu_util = _parse_metric(parts[2])
+                    power_w = _parse_metric(parts[3])
+                    temp = _parse_metric(parts[4])
                     break
     except Exception:
         pass
@@ -778,12 +802,18 @@ def _get_parent_visible_gpu_spec() -> Dict[str, Any]:
             }
 
         if has_subdevice:
-            # Dedup for display: multiple subdevice entries under the same
-            # root collapse to that root ID while preserving insertion order.
-            unique_roots = list(dict.fromkeys(roots_with_dupes))
+            # Subdevice syntax (e.g. "0.0,0.1") expands one or more root
+            # GPUs into multiple logical devices. These logical ordinals
+            # do not map cleanly back to stable physical root IDs for
+            # explicit selection, so mirror the CUDA UUID/MIG and wildcard
+            # path: return numeric_ids=None and supports_explicit_gpu_ids
+            # False. Downstream (get_visible_gpu_utilization,
+            # get_backend_visible_gpu_info, get_device_map) then enumerates
+            # torch-visible ordinals and can still shard across the logical
+            # devices instead of collapsing them onto a single root.
             return {
                 "raw": xpu_mask,
-                "numeric_ids": unique_roots,
+                "numeric_ids": None,
                 "supports_explicit_gpu_ids": False,
             }
 
@@ -1428,11 +1458,16 @@ def get_physical_gpu_count() -> int:
 def _backend_visible_devices_env() -> Optional[str]:
     """Return the raw visibility env string that applies to this backend.
 
-    On ROCm, HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES take precedence
-    over CUDA_VISIBLE_DEVICES; the helper mirrors the resolution logic in
+    On XPU, ``ZE_AFFINITY_MASK`` is the visibility control (not
+    ``CUDA_VISIBLE_DEVICES``). On ROCm, ``HIP_VISIBLE_DEVICES`` /
+    ``ROCR_VISIBLE_DEVICES`` take precedence over ``CUDA_VISIBLE_DEVICES``;
+    the helper mirrors the resolution logic in
     ``_get_parent_visible_gpu_spec`` so ``backend_cuda_visible_devices``
-    reports the value that is actually narrowing the visible device set.
+    reports the value that is actually narrowing the visible device set on
+    the current backend.
     """
+    if get_device() == DeviceType.XPU:
+        return os.environ.get("ZE_AFFINITY_MASK")
     if IS_ROCM:
         return _get_parent_visible_gpu_spec().get("raw")
     return os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -1629,6 +1664,10 @@ def apply_gpu_ids(gpu_ids) -> None:
     # so worker subprocesses are actually restricted to the intended GPU.
     if get_device() == DeviceType.XPU:
         os.environ["ZE_AFFINITY_MASK"] = value
+        # Clear any stale CUDA_VISIBLE_DEVICES the parent may have inherited
+        # so tools that inspect the environment do not show conflicting
+        # pinning state (torch.xpu itself only reads ZE_AFFINITY_MASK).
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         _visible_gpu_count = None
         logger.info("Applied gpu_ids: ZE_AFFINITY_MASK='%s'", value)
         return

@@ -38,6 +38,7 @@ from utils.hardware import (
     safe_num_proc,
     dataset_map_num_proc,
     get_device_map,
+    get_torch_device_str,
     raise_if_offloaded,
     get_visible_gpu_count,
 )
@@ -1540,7 +1541,6 @@ class UnslothTrainer:
 
         SNAC_MODEL_NAME = "hubertsiuzdak/snac_24khz"
         SNAC_SAMPLE_RATE = 24000
-        from utils.hardware import get_torch_device_str
 
         device = get_torch_device_str()
         max_length = self.max_seq_length or 2048
@@ -1718,7 +1718,6 @@ class UnslothTrainer:
         import gc
 
         gc.collect()
-        from utils.hardware import clear_gpu_cache
 
         clear_gpu_cache()
         self._cuda_audio_used = True
@@ -1748,7 +1747,6 @@ class UnslothTrainer:
 
         import subprocess
 
-        from utils.hardware import get_torch_device_str
 
         device = get_torch_device_str()
 
@@ -1950,7 +1948,6 @@ class UnslothTrainer:
         import gc
 
         gc.collect()
-        from utils.hardware import clear_gpu_cache
 
         clear_gpu_cache()
         self._cuda_audio_used = True
@@ -1987,7 +1984,6 @@ class UnslothTrainer:
         from datasets import Dataset as HFDataset
         from utils.paths import ensure_dir, tmp_root
 
-        from utils.hardware import get_torch_device_str
 
         device = get_torch_device_str()
 
@@ -2167,7 +2163,6 @@ class UnslothTrainer:
         import gc
 
         gc.collect()
-        from utils.hardware import clear_gpu_cache
 
         clear_gpu_cache()
         self._cuda_audio_used = True

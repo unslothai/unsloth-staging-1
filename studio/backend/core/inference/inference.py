@@ -10,6 +10,7 @@ from unsloth.chat_templates import get_chat_template
 from transformers import TextStreamer
 from peft import PeftModel, PeftModelForCausalLM
 
+import contextlib
 import json
 import sys
 import torch
@@ -1646,7 +1647,6 @@ class InferenceBackend:
             + text
             + "<|text_end|>\n<|audio_start|><|global_features_start|>\n"
         )
-        import contextlib
 
         with torch.inference_mode():
             # Derive the autocast device from the loaded model, not from the

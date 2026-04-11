@@ -13,6 +13,8 @@ from pathlib import Path
 import shutil
 import tempfile
 
+from utils.hardware import get_device
+
 
 logger = get_logger(__name__)
 
@@ -107,10 +109,10 @@ def format_error_message(error: Exception, model_name: str) -> str:
         or "out_of_host_memory" in error_str  # ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY
         or "not enough memory" in error_str
         or "cannot allocate memory" in error_str
+        or "memory allocation failed" in error_str
+        or isinstance(error, MemoryError)
         or ("mlx" in error_str and ("memory" in error_str or "allocate" in error_str))
     ):
-        from utils.hardware import get_device
-
         device = get_device()
         device_label = {
             "cuda": "GPU",

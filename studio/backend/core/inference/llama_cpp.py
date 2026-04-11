@@ -26,6 +26,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+from utils.hardware import clear_gpu_cache, get_torch_device_str
+
 logger = get_logger(__name__)
 
 # ── Pre-compiled patterns for plan-without-action re-prompt ──
@@ -1625,10 +1627,6 @@ class LlamaCppBackend:
             if LlamaCppBackend._codec_mgr is not None:
                 LlamaCppBackend._codec_mgr.unload()
                 LlamaCppBackend._codec_mgr = None
-                import torch
-
-                from utils.hardware import clear_gpu_cache
-
                 clear_gpu_cache()
             return True
 
@@ -3262,8 +3260,6 @@ class LlamaCppBackend:
         if LlamaCppBackend._codec_mgr is None:
             LlamaCppBackend._codec_mgr = AudioCodecManager()
 
-        from utils.hardware import get_torch_device_str
-
         device = get_torch_device_str()
         model_repo_path = None
 
@@ -3335,10 +3331,6 @@ class LlamaCppBackend:
             if need_ids
             else None
         )
-
-        import torch
-
-        from utils.hardware import get_torch_device_str
 
         device = get_torch_device_str()
         return LlamaCppBackend._codec_mgr.decode(
