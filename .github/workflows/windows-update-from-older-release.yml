@@ -165,7 +165,8 @@ jobs:
           $Shots = Join-Path $env:RUNNER_TEMP "screenshots"
           New-Item -ItemType Directory -Force -Path $Shots | Out-Null
           Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$Port/" -OutFile (Join-Path $Shots "index.html")
-          Write-Host "[screenshot] installing playwright"
+          $VenvPy = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
+          Write-Host "[screenshot] installing playwright via $VenvPy"
           & $VenvPy -m pip install --quiet playwright
           & $VenvPy -m playwright install chromium | Out-Null
           $PyScript = @"
@@ -201,8 +202,12 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: windows-update-from-older-release-${{ github.run_id }}
-          path: |
-            ${{ env.USERPROFILE }}/.unsloth/studio/share/studio.log
-            ${{ runner.temp }}/screenshots
+          name: windows-update-from-older-release-screenshots-${{ github.run_id }}
+          path: ${{ runner.temp }}/screenshots
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-update-from-older-release-log-${{ github.run_id }}
+          path: ${{ env.USERPROFILE }}\.unsloth\studio\share\studio.log
           if-no-files-found: ignore
