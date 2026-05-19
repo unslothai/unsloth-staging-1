@@ -1,6 +1,14 @@
 name: macos-uninstall-reinstall
 
 on:
+  push:
+    branches: [studio-regression-ci]
+    paths:
+      - install.sh
+      - uninstall.sh
+      - studio/setup.sh
+      - unsloth_cli/**
+      - .github/workflows/macos-uninstall-reinstall.yml
   workflow_dispatch:
 
 concurrency:
