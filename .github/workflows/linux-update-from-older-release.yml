@@ -41,16 +41,19 @@ jobs:
         id: before
         run: |
           LAUNCHER="$HOME/.local/share/unsloth/launch-studio.sh"
-          INDEX="$HOME/.unsloth/studio/unsloth_studio/lib/python3.12/site-packages/studio/frontend/dist/index.html"
+          VENV_PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
           UNSLOTH_BIN="$HOME/.local/bin/unsloth"
           [[ -f "$LAUNCHER" ]] || { echo "FAIL: missing launcher"; exit 1; }
+          INDEX=$("$VENV_PY" -c "import pathlib, studio; print(pathlib.Path(studio.__file__).parent / 'frontend/dist/index.html')")
+          STUDIO_PKG=$("$VENV_PY" -c "import pathlib, studio; print(pathlib.Path(studio.__file__).parent)")
           LH=$(sha256sum "$LAUNCHER" | awk '{print $1}')
           IH=$(sha256sum "$INDEX" 2>/dev/null | awk '{print $1}' || echo missing)
-          VER=$("$UNSLOTH_BIN" --version 2>/dev/null || echo unknown)
+          VER=$("$VENV_PY" -c "import importlib.metadata as m; print(m.version('unsloth'))" 2>/dev/null || echo unknown)
           echo "launcher_hash=$LH" >> "$GITHUB_OUTPUT"
           echo "index_hash=$IH"    >> "$GITHUB_OUTPUT"
           echo "version=$VER"      >> "$GITHUB_OUTPUT"
-          echo "[before] launcher=$LH index=$IH version=$VER"
+          echo "studio_pkg=$STUDIO_PKG" >> "$GITHUB_OUTPUT"
+          echo "[before] launcher=$LH index=$IH version=$VER pkg=$STUDIO_PKG"
 
       - name: Overlay current tip into venv
         # Simulates the post-PR-merge world where the user already has
@@ -69,16 +72,19 @@ jobs:
         id: after
         run: |
           LAUNCHER="$HOME/.local/share/unsloth/launch-studio.sh"
-          INDEX="$HOME/.unsloth/studio/unsloth_studio/lib/python3.12/site-packages/studio/frontend/dist/index.html"
+          VENV_PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
           UNSLOTH_BIN="$HOME/.local/bin/unsloth"
           [[ -f "$LAUNCHER" ]] || { echo "FAIL: launcher gone after update"; exit 1; }
+          INDEX=$("$VENV_PY" -c "import pathlib, studio; print(pathlib.Path(studio.__file__).parent / 'frontend/dist/index.html')")
+          STUDIO_PKG=$("$VENV_PY" -c "import pathlib, studio; print(pathlib.Path(studio.__file__).parent)")
           LH=$(sha256sum "$LAUNCHER" | awk '{print $1}')
           IH=$(sha256sum "$INDEX" 2>/dev/null | awk '{print $1}' || echo missing)
-          VER=$("$UNSLOTH_BIN" --version 2>/dev/null || echo unknown)
+          VER=$("$VENV_PY" -c "import importlib.metadata as m; print(m.version('unsloth'))" 2>/dev/null || echo unknown)
           echo "launcher_hash=$LH" >> "$GITHUB_OUTPUT"
           echo "index_hash=$IH"    >> "$GITHUB_OUTPUT"
           echo "version=$VER"      >> "$GITHUB_OUTPUT"
-          echo "[after] launcher=$LH index=$IH version=$VER"
+          echo "studio_pkg=$STUDIO_PKG" >> "$GITHUB_OUTPUT"
+          echo "[after] launcher=$LH index=$IH version=$VER pkg=$STUDIO_PKG"
 
       - name: Assert launcher refreshed
         run: |
@@ -100,11 +106,12 @@ jobs:
           fi
           echo "PASS: frontend rewrote ($BI -> $AI)"
 
-      - name: Launch Studio + idle 90s + check load spam + auth status
+      - name: Launch Studio + idle 90s + check load spam + auth status + screenshots
         run: |
           PORT=8889
           LOG="$HOME/.unsloth/studio/share/studio.log"
-          mkdir -p "$(dirname "$LOG")"
+          SHOTS="$RUNNER_TEMP/screenshots"
+          mkdir -p "$(dirname "$LOG")" "$SHOTS"
           : > "$LOG"
           nohup "$HOME/.local/bin/unsloth" studio -H 127.0.0.1 -p $PORT \
             >>"$LOG" 2>&1 &
@@ -121,6 +128,27 @@ jobs:
             exit 1
           fi
           echo "PASS: requires_password_change=false"
+
+          # Triple confirm: download index.html and screenshot the rendered UI
+          curl -fsS "http://127.0.0.1:$PORT/" -o "$SHOTS/index.html"
+          echo "[screenshot] installing playwright"
+          pip install --quiet playwright
+          python -m playwright install --with-deps chromium >/dev/null
+          python - <<'PY'
+          import sys
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as pw:
+              browser = pw.chromium.launch()
+              for route in ("/", "/chat", "/train"):
+                  page = browser.new_page()
+                  page.goto(f"http://127.0.0.1:8889{route}", wait_until="networkidle", timeout=30000)
+                  page.screenshot(path=f"/tmp/shot_{route.strip('/').replace('/', '_') or 'root'}.png", full_page=True)
+                  print(f"shot {route} -> /tmp/shot_{route.strip('/').replace('/', '_') or 'root'}.png", flush=True)
+                  page.close()
+              browser.close()
+          PY
+          cp /tmp/shot_*.png "$SHOTS/" 2>/dev/null || true
+          ls -la "$SHOTS"
 
           echo "[idle] sleeping 90s to surface any /api/inference/load spam"
           sleep 90
@@ -139,4 +167,5 @@ jobs:
           name: linux-update-from-older-release-${{ github.run_id }}
           path: |
             ~/.unsloth/studio/share/studio.log
+            ${{ runner.temp }}/screenshots
           if-no-files-found: ignore

@@ -51,9 +51,10 @@ jobs:
         id: before
         run: |
           $Launcher = Join-Path $env:LOCALAPPDATA 'Unsloth Studio\launch-studio.ps1'
-          $Index = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Lib\site-packages\studio\frontend\dist\index.html'
           $VenvPy = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
           if (-not (Test-Path -LiteralPath $Launcher)) { Write-Host "FAIL: launcher missing"; exit 1 }
+          $Index = & $VenvPy -c "import pathlib, studio; print(pathlib.Path(studio.__file__).parent / 'frontend' / 'dist' / 'index.html')"
+          $StudioPkg = & $VenvPy -c "import pathlib, studio; print(pathlib.Path(studio.__file__).parent)"
           $LH = (Get-FileHash -LiteralPath $Launcher -Algorithm SHA256).Hash
           $IH = if (Test-Path -LiteralPath $Index) {
             (Get-FileHash -LiteralPath $Index -Algorithm SHA256).Hash
@@ -62,7 +63,8 @@ jobs:
           "launcher_hash=$LH" | Out-File -Append $env:GITHUB_OUTPUT
           "index_hash=$IH"    | Out-File -Append $env:GITHUB_OUTPUT
           "version=$Ver"      | Out-File -Append $env:GITHUB_OUTPUT
-          Write-Host "[before] launcher=$LH index=$IH version=$Ver"
+          "studio_pkg=$StudioPkg" | Out-File -Append $env:GITHUB_OUTPUT
+          Write-Host "[before] launcher=$LH index=$IH version=$Ver pkg=$StudioPkg"
 
       - name: Overlay current tip into venv (simulate post-PR-merge upgrade)
         run: |
@@ -80,9 +82,10 @@ jobs:
         id: after
         run: |
           $Launcher = Join-Path $env:LOCALAPPDATA 'Unsloth Studio\launch-studio.ps1'
-          $Index = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Lib\site-packages\studio\frontend\dist\index.html'
           $VenvPy = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
           if (-not (Test-Path -LiteralPath $Launcher)) { Write-Host "FAIL: launcher gone after update"; exit 1 }
+          $Index = & $VenvPy -c "import pathlib, studio; print(pathlib.Path(studio.__file__).parent / 'frontend' / 'dist' / 'index.html')"
+          $StudioPkg = & $VenvPy -c "import pathlib, studio; print(pathlib.Path(studio.__file__).parent)"
           $LH = (Get-FileHash -LiteralPath $Launcher -Algorithm SHA256).Hash
           $IH = if (Test-Path -LiteralPath $Index) {
             (Get-FileHash -LiteralPath $Index -Algorithm SHA256).Hash
@@ -91,7 +94,8 @@ jobs:
           "launcher_hash=$LH" | Out-File -Append $env:GITHUB_OUTPUT
           "index_hash=$IH"    | Out-File -Append $env:GITHUB_OUTPUT
           "version=$Ver"      | Out-File -Append $env:GITHUB_OUTPUT
-          Write-Host "[after] launcher=$LH index=$IH version=$Ver"
+          "studio_pkg=$StudioPkg" | Out-File -Append $env:GITHUB_OUTPUT
+          Write-Host "[after] launcher=$LH index=$IH version=$Ver pkg=$StudioPkg"
 
       - name: Assert launcher refreshed
         run: |
@@ -141,6 +145,29 @@ jobs:
           }
           Write-Host "PASS: requires_password_change=false"
 
+          $Shots = Join-Path $env:RUNNER_TEMP "screenshots"
+          New-Item -ItemType Directory -Force -Path $Shots | Out-Null
+          Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$Port/" -OutFile (Join-Path $Shots "index.html")
+          Write-Host "[screenshot] installing playwright"
+          & $VenvPy -m pip install --quiet playwright
+          & $VenvPy -m playwright install chromium | Out-Null
+          $PyScript = @"
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as pw:
+              browser = pw.chromium.launch()
+              for route in ('/', '/chat', '/train'):
+                  page = browser.new_page()
+                  page.goto(f'http://127.0.0.1:$Port{route}', wait_until='networkidle', timeout=30000)
+                  name = route.strip('/').replace('/', '_') or 'root'
+                  page.screenshot(path=rf'$Shots\\shot_{name}.png', full_page=True)
+                  print(f'shot {route} -> shot_{name}.png', flush=True)
+                  page.close()
+              browser.close()
+          "@
+          $PyScript | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'shot.py')
+          & $VenvPy (Join-Path $env:RUNNER_TEMP 'shot.py')
+          Get-ChildItem $Shots
+
           Write-Host "[idle] sleeping 90s to surface any /api/inference/load spam"
           Start-Sleep -Seconds 90
           $Spam = (Get-Content -LiteralPath $Log -ErrorAction SilentlyContinue | Select-String -Pattern '"path": "/api/inference/load"').Count
@@ -160,4 +187,5 @@ jobs:
           name: windows-update-from-older-release-${{ github.run_id }}
           path: |
             ${{ env.USERPROFILE }}/.unsloth/studio/share/studio.log
+            ${{ runner.temp }}/screenshots
           if-no-files-found: ignore
