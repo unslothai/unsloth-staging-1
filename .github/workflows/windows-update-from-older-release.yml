@@ -197,7 +197,7 @@ jobs:
           }
           Write-Host "PASS: no load-spam after update"
 
-          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          if ($job) { Stop-Job -Job $job -ErrorAction SilentlyContinue; Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
 
       - uses: actions/upload-artifact@v4
         if: always()
