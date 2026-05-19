@@ -121,25 +121,25 @@ jobs:
           }
           Write-Host "PASS: frontend rewrote ($bi -> $ai)"
 
-      - name: Launch Studio + idle 90s + check load spam + auth status
+      - name: Launch Studio in background (PowerShell job) + health-check
         run: |
           $Port = 8889
           $StudioHome = Join-Path $env:USERPROFILE '.unsloth\studio'
           $Log = Join-Path $StudioHome 'share\studio.log'
           New-Item -ItemType Directory -Force -Path (Split-Path $Log) | Out-Null
           Set-Content -LiteralPath $Log -Value ""
-
-          # unsloth.exe was rebuilt by the update step and is the simplest way
-          # to launch Studio matching what real users do. We redirect via cmd
-          # because PowerShell Start-Process -RedirectStandardOutput sometimes
-          # detaches the child and never flushes the file on Windows runners.
           $UnslothExe = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\unsloth.exe'
           if (-not (Test-Path -LiteralPath $UnslothExe)) {
             Write-Host "FAIL: unsloth.exe missing after update"; exit 1
           }
-          Start-Process -FilePath cmd.exe `
-            -ArgumentList @('/c', "`"$UnslothExe`" studio -H 127.0.0.1 -p $Port > `"$Log`" 2>&1") `
-            -WindowStyle Hidden
+          # PowerShell job survives the step boundary and inherits no console;
+          # write to a separate file we can tail for diagnosis.
+          $JobLog = $Log + '.job'
+          $job = Start-Job -ScriptBlock {
+            param($exe, $port, $log)
+            & $exe studio -H 127.0.0.1 -p $port *> $log
+          } -ArgumentList @($UnslothExe, $Port, $JobLog)
+          Write-Host "[launch] Studio job id=$($job.Id) state=$($job.State)"
 
           for ($i = 0; $i -lt 240; $i++) {
             try {
@@ -147,13 +147,12 @@ jobs:
               if ($r.StatusCode -eq 200) { break }
             } catch { Start-Sleep -Seconds 1 }
           }
-          if (-not (Test-Path -LiteralPath $Log)) {
-            Write-Host "FAIL: studio.log never created"; exit 1
-          }
           $health = try { Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$Port/api/health" -TimeoutSec 2 -ErrorAction Stop } catch { $null }
           if (-not $health) {
-            Write-Host "FAIL: Studio did not come up at port $Port; last 40 log lines:"
-            Get-Content -LiteralPath $Log -Tail 40
+            Write-Host "FAIL: Studio did not come up at port $Port within 240s; job state=$($job.State), tail of $JobLog :"
+            Get-Content -LiteralPath $JobLog -Tail 60 -ErrorAction SilentlyContinue
+            Write-Host "--- live Receive-Job ---"
+            Receive-Job -Job $job -Keep 2>&1 | Select-Object -Last 40
             exit 1
           }
           Write-Host "[health] $($health.Content)"
