@@ -13,6 +13,8 @@ import sys
 import tempfile
 import time
 import types
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
@@ -1061,7 +1063,160 @@ def _run_setup_script(*, verbose: bool = False) -> None:
         result = subprocess.run(["bash", str(script)], env = env)
 
     if result.returncode != 0:
+        _print_windows_exe_lock_hint_if_relevant()
         raise typer.Exit(result.returncode)
+
+
+def _print_windows_exe_lock_hint_if_relevant() -> None:
+    """When pip's reinstall fails because unsloth.exe is locked, point users
+    at the python -m workaround. Best-effort: detection looks for our running
+    unsloth.exe in the venv Scripts dir and assumes pip's WinError 32 lock.
+    """
+    if platform.system() != "Windows":
+        return
+    try:
+        venv_scripts = Path(sys.executable).resolve().parent
+    except OSError:
+        return
+    exe = venv_scripts / "unsloth.exe"
+    if not exe.exists():
+        return
+    typer.echo("")
+    typer.echo("Windows holds unsloth.exe open while it is running, so pip")
+    typer.echo("cannot replace it. Re-run the update via the venv python:")
+    typer.echo(
+        f"    {sys.executable} -c \"from unsloth_cli import app; "
+        "app(['studio', 'update', '--local'])\""
+    )
+
+
+_INSTALLER_URL_BASH = "https://unsloth.ai/install.sh"
+_INSTALLER_URL_PWSH = "https://unsloth.ai/install.ps1"
+
+
+def _refresh_desktop_shortcuts(*, verbose: bool = False) -> None:
+    """Re-run installer shortcut creation so updates refresh the launcher.
+
+    setup.sh / setup.ps1 only touch the venv; the macOS .app bundle, the Linux
+    .desktop entry, the Windows Start Menu / Desktop .lnk shortcuts, and the
+    shared launcher script all bake their paths at install time. Without this
+    call, `unsloth studio update` leaves the user's icon pointing at the old
+    install.
+    """
+    env = {**os.environ}
+    if verbose:
+        env["UNSLOTH_VERBOSE"] = "1"
+
+    is_windows = platform.system() == "Windows"
+    installer_name = "install.ps1" if is_windows else "install.sh"
+    installer_url = _INSTALLER_URL_PWSH if is_windows else _INSTALLER_URL_BASH
+
+    # Local install: reuse the installer from the same checkout (matches the
+    # behavior of `install.{sh,ps1} --local` and avoids a network fetch).
+    local_repo = (os.environ.get("STUDIO_LOCAL_REPO") or "").strip()
+    candidates: list[Path] = []
+    if local_repo:
+        candidates.append(Path(local_repo) / installer_name)
+    candidates.append(_PACKAGE_ROOT / installer_name)
+
+    args = ["--shortcuts-only"]
+    if verbose:
+        args.append("--verbose")
+
+    if is_windows:
+        ps_argv: list[str] = ["powershell.exe"]
+        if _should_hide_windows_subprocesses():
+            ps_argv.extend(
+                ["-NoLogo", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden"]
+            )
+
+        for script in candidates:
+            try:
+                if script.is_file():
+                    quoted = str(script).replace("'", "''")
+                    argv = list(ps_argv)
+                    argv.extend(
+                        [
+                            "-ExecutionPolicy",
+                            "Bypass",
+                            "-Command",
+                            f"& '{quoted}' {' '.join(args)} *>&1",
+                        ]
+                    )
+                    subprocess.run(
+                        argv,
+                        env = env,
+                        check = False,
+                        **_windows_hidden_subprocess_kwargs(),
+                    )
+                    return
+            except OSError:
+                continue
+
+        # PyPI installs do not ship install.ps1; fetch the upstream copy and
+        # invoke it from stdin via Invoke-Expression.
+        try:
+            request = urllib.request.Request(
+                installer_url, headers = {"User-Agent": "unsloth-studio-update"}
+            )
+            with urllib.request.urlopen(request, timeout = 30) as response:
+                installer = response.read().decode("utf-8", errors = "replace")
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            typer.echo(
+                f"  refresh-launcher  skipped: could not fetch {installer_url} ({exc})"
+            )
+            return
+
+        # install.ps1 wraps everything in Install-UnslothStudio and invokes it
+        # with @args at the bottom. From an Invoke-Expression-style stdin
+        # pipe, $args is empty, so append an explicit call with our flags.
+        marker_args = " ".join(args)
+        wrapper = installer + f"\nInstall-UnslothStudio {marker_args}\n"
+        argv = list(ps_argv)
+        argv.extend(["-ExecutionPolicy", "Bypass", "-Command", "-"])
+        try:
+            subprocess.run(
+                argv,
+                input = wrapper,
+                text = True,
+                env = env,
+                check = False,
+                **_windows_hidden_subprocess_kwargs(),
+            )
+        except OSError as exc:
+            typer.echo(f"  refresh-launcher  skipped: powershell exec failed ({exc})")
+        return
+
+    for script in candidates:
+        try:
+            if script.is_file():
+                subprocess.run(["bash", str(script), *args], env = env, check = False)
+                return
+        except OSError:
+            continue
+
+    # PyPI installs do not ship install.sh; fetch the upstream copy.
+    try:
+        request = urllib.request.Request(
+            installer_url, headers = {"User-Agent": "unsloth-studio-update"}
+        )
+        with urllib.request.urlopen(request, timeout = 30) as response:
+            installer = response.read()
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        typer.echo(
+            f"  refresh-launcher  skipped: could not fetch {installer_url} ({exc})"
+        )
+        return
+
+    try:
+        subprocess.run(
+            ["bash", "-s", "--", *args],
+            input = installer,
+            env = env,
+            check = False,
+        )
+    except OSError as exc:
+        typer.echo(f"  refresh-launcher  skipped: bash exec failed ({exc})")
 
 
 @studio_app.command(hidden = True)
@@ -1105,7 +1260,37 @@ def update(
     else:
         os.environ["STUDIO_LOCAL_INSTALL"] = "0"
         os.environ.pop("STUDIO_LOCAL_REPO", None)
+    _release_self_exe_lock_windows()
     _run_setup_script(verbose = verbose)
+    _refresh_desktop_shortcuts(verbose = verbose)
+
+
+def _release_self_exe_lock_windows() -> None:
+    """Rename the running unsloth.exe out of the way so pip's reinstall can
+    drop a new copy on Windows. setup.ps1 also retries this from its own
+    PowerShell process, which is the truly reliable path.
+    """
+    if platform.system() != "Windows":
+        return
+    try:
+        venv_scripts = Path(sys.executable).resolve().parent
+    except OSError:
+        return
+    # python.exe sits in the venv Scripts dir alongside unsloth.exe
+    exe = venv_scripts / "unsloth.exe"
+    if not exe.exists():
+        return
+    stale = exe.with_suffix(".exe.deleteme")
+    try:
+        if stale.exists():
+            stale.unlink()
+    except OSError:
+        pass
+    try:
+        exe.rename(stale)
+    except OSError as e:
+        # Not fatal -- setup.ps1 retries the rename from a sibling process.
+        print(f"[update] could not rename {exe.name} -> {stale.name}: {e}")
 
 
 # ── unsloth studio reset-password ────────────────────────────────────
