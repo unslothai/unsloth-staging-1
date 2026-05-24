@@ -129,3 +129,5 @@ jobs:
 # Re-trigger: PR #684 head 23751c84 with PR #5656 head 1a026435 round-3 final.
 
 # Re-trigger: PR #684 head 8c278327 (restore mask = kwargs.get in 4 VLM patched functions broken by round-3 ruff cleanup).
+
+# Re-trigger: PR #684 head 1d0c11ed (round-4 multi-epoch labeled batch reseed for torch_randperm parity).

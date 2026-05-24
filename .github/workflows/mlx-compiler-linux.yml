@@ -84,3 +84,5 @@ jobs:
 # Re-trigger: PR #684 head d16ef240 (round-3 P1/P2: elementwise max_grad_value, iterable VLM raise, Qwen3 vision flag restore, ordered batches pad token).
 
 # Re-trigger: PR #684 head 23751c84 (round-3 P1/P2 final: labeled torch_randperm, num_epochs, norm-patch hardening, VLM completion masking, ruff cleanup).
+
+# Re-trigger: PR #684 head 1d0c11ed; final round-4 head.
