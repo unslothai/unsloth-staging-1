@@ -78,22 +78,35 @@ jobs:
           sys.path.insert(0, 'unsloth-pr5656/studio/backend')
           from models.training import TrainingStartRequest
 
-          req = TrainingStartRequest(
+          common = dict(
               model_name='unsloth/test',
-              dataset='dummy',
+              training_type='LoRA/QLoRA',
+              format_type='alpaca',
+              hf_dataset='yahma/alpaca-cleaned',
+          )
+          req = TrainingStartRequest(
               max_grad_value=None,
               cast_norm_output_to_input_dtype=False,
+              **common,
           )
           assert req.max_grad_value is None, req.max_grad_value
           assert req.cast_norm_output_to_input_dtype is False, req.cast_norm_output_to_input_dtype
 
           req2 = TrainingStartRequest(
-              model_name='unsloth/test',
-              dataset='dummy',
               max_grad_value=0.3,
+              **common,
           )
           assert req2.max_grad_value == 0.3, req2.max_grad_value
           assert req2.cast_norm_output_to_input_dtype is True, req2.cast_norm_output_to_input_dtype
+
+          # Confirm the two fields show up in the model's JSON schema with
+          # the expected types - that is what PR #5656 wires through to the
+          # FastAPI OpenAPI document.
+          schema = TrainingStartRequest.model_json_schema()
+          mgv = schema['properties']['max_grad_value']
+          cnd = schema['properties']['cast_norm_output_to_input_dtype']
+          assert any(t.get('type') == 'null' for t in mgv.get('anyOf', [])), mgv
+          assert cnd['type'] == 'boolean' and cnd['default'] is True, cnd
           print('OK: max_grad_value + cast_norm_output_to_input_dtype plumb through pydantic correctly.')
           PY
 

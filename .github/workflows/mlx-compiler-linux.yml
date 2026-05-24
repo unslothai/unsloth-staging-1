@@ -60,16 +60,6 @@ jobs:
           python -m pip install --no-deps --force-reinstall \
             "git+https://github.com/${{ matrix.zoo-ref.repo }}@${{ matrix.zoo-ref.ref }}"
 
-      - name: Show installed compiler.py SHA-line context
-        run: |
-          python - <<'PY'
-          import inspect, unsloth_zoo.compiler as c
-          src = inspect.getsource(c)
-          for needle in ["cross_entropy_replacement_2 =", "# UNSLOTH_RETURN_LOGITS=1 path.", "Prepended `logits = self.lm_head"]:
-              idx = src.find(needle)
-              print(f"{needle!r:55s} -> index {idx}")
-          PY
-
       - name: Run compiler.py regression check
         run: |
           # On the PR head this is expected to FAIL (the regression).

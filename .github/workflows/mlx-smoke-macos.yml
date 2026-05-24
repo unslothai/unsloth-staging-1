@@ -93,13 +93,14 @@ jobs:
           # tests/studio/run_real_mlx_smoke.py was refreshed by PR #5656
           # to assert len(losses_per_step) == config.max_steps (30 by
           # default, set by PR #5537 of unsloth main).
-          python -u tests/studio/run_real_mlx_smoke.py train
+          mkdir -p "${{ github.workspace }}/mlx_smoke_workdir"
+          python -u tests/studio/run_real_mlx_smoke.py train --workdir "${{ github.workspace }}/mlx_smoke_workdir"
 
       - name: Run 30-step real MLX smoke (eval subcommand)
         working-directory: unsloth-pr5656
         run: |
           # Eval gate verifies the post-train completion contains "Unsloth".
-          python -u tests/studio/run_real_mlx_smoke.py eval || true
+          python -u tests/studio/run_real_mlx_smoke.py eval --workdir "${{ github.workspace }}/mlx_smoke_workdir" || true
 
       - name: Upload smoke output on failure
         if: failure()
