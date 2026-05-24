@@ -42,27 +42,28 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install CPU torch + transformers + pytest
+      - name: Install minimal deps
         run: |
           python -m pip install --upgrade pip
-          # CPU-only torch keeps the Linux runner light. unsloth-zoo's
-          # device_type @cache captures "cuda" via the spoof at import.
-          python -m pip install --index-url https://download.pytorch.org/whl/cpu \
-            'torch==2.6.0+cpu'
-          python -m pip install \
-            'transformers==4.57.6' \
-            'numpy<3' \
-            'regex' \
-            'pytest' \
-            'triton'
-          # unsloth_zoo/compiler.py does `import triton` at module top
-          # level (line 51). Triton has Linux x86_64 wheels even without
-          # a GPU; we just need the import to succeed.
+          # The regression check now reads unsloth_zoo/compiler.py as
+          # raw text (no import), so we don't need torch / transformers
+          # / triton on the runner. Just install unsloth-zoo from the
+          # requested ref and pytest.
+          python -m pip install pytest
 
       - name: Install unsloth-zoo @ ${{ matrix.zoo-ref.label }}
         run: |
-          python -m pip install --no-deps --force-reinstall \
+          # --no-deps is required because the regular zoo install pulls
+          # in torch + bitsandbytes etc. We only need the .py text.
+          python -m pip install --no-deps --no-build-isolation --force-reinstall \
             "git+https://github.com/${{ matrix.zoo-ref.repo }}@${{ matrix.zoo-ref.ref }}"
+          python - <<'PY'
+          import importlib.util, os
+          spec = importlib.util.find_spec("unsloth_zoo")
+          path = os.path.join(spec.submodule_search_locations[0], "compiler.py")
+          print(f"installed compiler.py: {path}")
+          print(f"size: {os.path.getsize(path)} bytes")
+          PY
 
       - name: Run compiler.py regression check
         run: |

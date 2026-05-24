@@ -55,10 +55,14 @@ jobs:
             'starlette' \
             'pytest' \
             'regex' \
-            'datasets'
-          # test_training_raw_support.py imports `from datasets import
-          # Dataset` at collection time, so datasets has to be present
-          # even though the tests do not actually train.
+            'datasets' \
+            'structlog' \
+            'httpx' \
+            'aiosqlite'
+          # The studio backend test modules import datasets at
+          # collection time and the training package pulls in
+          # structlog / httpx / aiosqlite via core/training/__init__.
+          # Install them so test collection completes.
 
       - name: Install unsloth-zoo PR #684 head (mmathew23/explore/mlx)
         shell: bash

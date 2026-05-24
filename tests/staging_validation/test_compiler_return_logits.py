@@ -7,161 +7,105 @@ lives in the regex template `cross_entropy_replacement_2`: the
 dedicated `UNSLOTH_RETURN_LOGITS=1` elif branch that reuses the
 already-materialised logits was deleted. Under `UNSLOTH_RETURN_LOGITS=1`
 with labels present, control now falls through to the unconditional
-`else:` branch which calls `self.lm_head(hidden_states)` a SECOND time
+`else:` branch which calls `self.lm_head(hidden_states)` a second time
 on top of the prepended matmul at compiler.py:2079/2087.
 
-The default path (`UNSLOTH_FUSED_FORWARD=1`, AST rewriter) is
-unaffected because it produces a single-matmul forward for the
-canonical HF triplet. The regression bites only the fallback path:
-`UNSLOTH_FUSED_FORWARD=0`, or any model forward whose shape doesn't
-match the AST rewriter's triplet.
+The check below reads `unsloth_zoo/compiler.py` as raw text (no
+import) and looks for the dedicated elif branch verbatim. This
+sidesteps unsloth_zoo's import-time GPU + triton requirements, so
+the test runs on a stock CPU runner with no spoofing.
 
-This test runs `apply_fused_lm_head` on a small set of HF model
-families under `UNSLOTH_FUSED_FORWARD=0` and asserts that the
-dedicated elif branch is present. Expected outcome:
-- On unsloth-zoo main:                  PASS
-- On unsloth-zoo PR #684 (explore/mlx): FAIL
-
-The test uses CPU only and a CUDA spoof so it runs on any Linux runner.
+Expected outcome:
+- On unsloth-zoo main:                  PASS (elif present)
+- On unsloth-zoo PR #684 (explore/mlx): FAIL (elif removed)
 """
 from __future__ import annotations
 
 import importlib.util
 import os
 import re
-import sys
-import types
 
 
-def _ensure_cuda_spoof() -> None:
-    """Force unsloth_zoo.device_type to capture 'cuda' on CPU runners."""
-    try:
-        import torch  # noqa: F401
-    except Exception:
-        return
-
-    # Stub mem_get_info / capability so unsloth_zoo's import-time probes
-    # don't crash on a CPU-only runner.
-    try:
-        import torch.cuda.memory as _cuda_memory  # type: ignore
-        _cuda_memory.mem_get_info = lambda *a, **k: (0, 80 * 1024**3)
-    except Exception:
-        pass
-    try:
-        import torch
-        torch.cuda.get_device_capability = lambda *a, **k: (8, 0)
-        torch.cuda.is_bf16_supported = lambda *a, **k: True
-    except Exception:
-        pass
-
-    package = "unsloth_zoo"
-    target = f"{package}.device_type"
-    if target in sys.modules:
-        return
-    pkg_spec = importlib.util.find_spec(package)
-    if pkg_spec is None or not pkg_spec.submodule_search_locations:
-        return
-    pkg_path = pkg_spec.submodule_search_locations[0]
-
-    skeleton_already = package in sys.modules
-    if not skeleton_already:
-        skel = types.ModuleType(package)
-        skel.__path__ = [pkg_path]
-        skel.__spec__ = pkg_spec
-        skel.__package__ = package
-        sys.modules[package] = skel
-
-    try:
-        utils_full = f"{package}.utils"
-        if utils_full not in sys.modules:
-            utils_path = os.path.join(pkg_path, "utils.py")
-            utils_spec = importlib.util.spec_from_file_location(utils_full, utils_path)
-            utils_mod = importlib.util.module_from_spec(utils_spec)
-            sys.modules[utils_full] = utils_mod
-            utils_spec.loader.exec_module(utils_mod)
-
-        dt_path = os.path.join(pkg_path, "device_type.py")
-        dt_spec = importlib.util.spec_from_file_location(target, dt_path)
-        dt_mod = importlib.util.module_from_spec(dt_spec)
-        sys.modules[target] = dt_mod
-
-        import torch
-        _orig = torch.cuda.is_available
-        torch.cuda.is_available = lambda: True  # type: ignore[assignment]
-        try:
-            dt_spec.loader.exec_module(dt_mod)
-        finally:
-            torch.cuda.is_available = _orig
-    finally:
-        if not skeleton_already:
-            sys.modules.pop(package, None)
-
-
-MODELS = [
-    "transformers.models.llama.modeling_llama:LlamaForCausalLM",
-    "transformers.models.mistral.modeling_mistral:MistralForCausalLM",
-    "transformers.models.qwen3.modeling_qwen3:Qwen3ForCausalLM",
-    "transformers.models.gemma2.modeling_gemma2:Gemma2ForCausalLM",
-]
-
-
-def _load_attr(dotted: str):
-    mod_path, _, attr = dotted.partition(":")
-    import importlib
-    mod = importlib.import_module(mod_path)
-    return getattr(mod, attr)
+def _locate_compiler_py() -> str:
+    """Return the absolute path to the installed
+    ``unsloth_zoo/compiler.py`` without importing the package."""
+    spec = importlib.util.find_spec("unsloth_zoo")
+    if spec is None or not spec.submodule_search_locations:
+        raise RuntimeError("unsloth_zoo not installed")
+    pkg_path = spec.submodule_search_locations[0]
+    path = os.path.join(pkg_path, "compiler.py")
+    if not os.path.isfile(path):
+        raise RuntimeError(f"unsloth_zoo/compiler.py not found at {path}")
+    return path
 
 
 def test_compiler_template_keeps_dedicated_return_logits_elif():
     """The compiler.py template path must keep the dedicated
-    UNSLOTH_RETURN_LOGITS=1 elif branch (the one that reuses the
-    prepended logits via self.loss_function), otherwise the template
-    falls through to a double-matmul else.
+    UNSLOTH_RETURN_LOGITS=1 elif branch added by zoo PR #666
+    (commit f45c31e5). Without it, the template falls through to a
+    double-`self.lm_head` matmul `else:` when UNSLOTH_RETURN_LOGITS=1.
     """
-    # Force fallback path so we measure the regex template, not the AST
-    # rewriter that runs at unsloth_zoo import time.
-    os.environ["UNSLOTH_FUSED_FORWARD"] = "0"
+    path = _locate_compiler_py()
+    src = open(path, encoding="utf-8").read()
 
-    _ensure_cuda_spoof()
+    # The template constant we are inspecting.
+    template_name = "cross_entropy_replacement_2"
+    assert template_name in src, (
+        f"{template_name} string constant missing from compiler.py at {path}; "
+        "the file shape has changed and the regression check needs an update."
+    )
 
-    import inspect
+    # Extract the literal text of cross_entropy_replacement_2 (it's a
+    # `name = """...""".replace(...)` triple-quoted string).
+    body_match = re.search(
+        r'cross_entropy_replacement_2\s*=\s*"""(.+?)"""',
+        src,
+        flags=re.DOTALL,
+    )
+    assert body_match, "could not locate cross_entropy_replacement_2 body in compiler.py"
+    template_body = body_match.group(1)
 
-    import unsloth_zoo.compiler as c
+    # The dedicated UNSLOTH_RETURN_LOGITS=1 elif branch from #666 looks
+    # like (verbatim from f45c31e5):
+    #
+    #   elif self.loss_function.__name__.endswith("ForCausalLMLoss") \
+    #        and labels is not None:
+    #       # UNSLOTH_RETURN_LOGITS=1 path. Prepended `logits = self.lm_head(...)`
+    #       # already materialised the full lm_head matmul; apply the captured logit
+    #       # scale/softcap transforms and route loss through self.loss_function on
+    #       # those logits instead of letting unsloth_fused_ce_loss redo the matmul.
+    #       if (\2) != ():
+    #           logits = logits * (\2)
+    #       ...
+    #       loss = self.loss_function(logits, labels.to(self.lm_head.weight.device), vocab_size=\8, **\9)
+    elif_present = re.search(
+        r'elif self\.loss_function\.__name__\.endswith\("ForCausalLMLoss"\)\s+'
+        r'and labels is not None:\s*\n'
+        r'(?:[^\n]*\n){0,3}'
+        r'\s*#[^\n]*UNSLOTH_RETURN_LOGITS=1 path',
+        template_body,
+    )
 
-    failures = []
-
-    for dotted in MODELS:
-        cls = _load_attr(dotted)
-        src = inspect.getsource(cls.forward)
-        out = c.fixup_fused_lm_head(src)
-        out, _ = c.apply_fused_lm_head(out, cls.__name__)
-
-        if "NOT_RETURN_LOGITS" not in out:
-            failures.append(
-                f"{cls.__name__}: template path did not patch the forward "
-                f"(missing NOT_RETURN_LOGITS sentinel). Cannot evaluate."
-            )
-            continue
-
-        # The dedicated elif from #666 looks like:
-        #   elif self.loss_function.__name__.endswith("ForCausalLMLoss") \
-        #        and labels is not None:
-        #       # UNSLOTH_RETURN_LOGITS=1 path. Prepended `logits = self.lm_head(...)`
-        #       ...
-        #       loss = self.loss_function(logits, labels.to(...), vocab_size=...)
-        dedicated = re.search(
-            r"elif self\.loss_function\.__name__\.endswith\(.ForCausalLMLoss.\) "
-            r"and labels is not None:\s*\n[^\n]*UNSLOTH_RETURN_LOGITS",
-            out,
+    if not elif_present:
+        # Show a useful failure: print the tail of the template so the
+        # reviewer can see the current else: branch the template falls
+        # through to.
+        else_match = re.search(
+            r'(else:\s*\n\s*logits = self\.lm_head\(hidden_states\\1\)[\s\S]*?)$',
+            template_body,
+            flags=re.MULTILINE,
         )
-
-        if not dedicated:
-            failures.append(
-                f"{cls.__name__}: dedicated UNSLOTH_RETURN_LOGITS=1 elif branch is "
-                f"MISSING from compiler.py template output. PR #684 reintroduces the "
-                f"double-matmul bug #666 fixed (commit f45c31e5)."
-            )
-
-    if failures:
-        msg = "\n".join(["compiler.py template regression detected:"] + failures)
-        raise AssertionError(msg)
+        else_excerpt = else_match.group(1) if else_match else "<else: branch not found>"
+        raise AssertionError(
+            "compiler.py template regression detected:\n"
+            f"  installed compiler.py: {path}\n"
+            "  dedicated UNSLOTH_RETURN_LOGITS=1 elif branch is MISSING from "
+            "cross_entropy_replacement_2.\n"
+            "  PR #684 (commit 5895b20c) removed the elif; ca086522 only "
+            "restored the NOT_RETURN_LOGITS guard on the fused_ce_loss branch.\n"
+            "  Net effect: under UNSLOTH_RETURN_LOGITS=1 with labels, the "
+            "template now falls through to:\n"
+            f"---\n{else_excerpt[:600]}\n---\n"
+            "...which calls self.lm_head a second time on top of the prepended "
+            "matmul at compiler.py:2079/2087. This is the bug PR #666 fixed."
+        )
