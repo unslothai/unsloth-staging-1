@@ -121,3 +121,5 @@ jobs:
 # Re-trigger: PR #684 head 0753b115 with round-2 fixes; confirm MLX smoke still green.
 
 # Re-trigger: PR #684 head 4cb6ca66 round-3 fixes; confirm macOS MLX smoke still green.
+
+# Re-trigger: PR #684 head 6374bad6 (HF parity decay for SGD/Muon/Lion); confirm macOS smoke still green.
