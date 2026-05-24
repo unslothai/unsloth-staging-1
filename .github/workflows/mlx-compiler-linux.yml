@@ -53,7 +53,11 @@ jobs:
             'transformers==4.57.6' \
             'numpy<3' \
             'regex' \
-            'pytest'
+            'pytest' \
+            'triton'
+          # unsloth_zoo/compiler.py does `import triton` at module top
+          # level (line 51). Triton has Linux x86_64 wheels even without
+          # a GPU; we just need the import to succeed.
 
       - name: Install unsloth-zoo @ ${{ matrix.zoo-ref.label }}
         run: |

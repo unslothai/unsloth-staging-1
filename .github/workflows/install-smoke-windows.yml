@@ -54,7 +54,11 @@ jobs:
             'fastapi' \
             'starlette' \
             'pytest' \
-            'regex'
+            'regex' \
+            'datasets'
+          # test_training_raw_support.py imports `from datasets import
+          # Dataset` at collection time, so datasets has to be present
+          # even though the tests do not actually train.
 
       - name: Install unsloth-zoo PR #684 head (mmathew23/explore/mlx)
         shell: bash
