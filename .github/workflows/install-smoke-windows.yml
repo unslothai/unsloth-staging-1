@@ -133,3 +133,5 @@ jobs:
           python -m pytest -x -v tests/test_mlx_training_worker_config.py
 
 # Re-trigger: confirm Windows schema check still passes on PR #5656 head bff5b443.
+
+# Re-trigger: PR #5656 head bff5b443 with present-but-None seed fix; confirm Windows schema still green.

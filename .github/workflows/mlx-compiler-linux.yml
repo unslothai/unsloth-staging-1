@@ -74,3 +74,5 @@ jobs:
           python -m pytest -x -v tests/staging_validation/test_compiler_return_logits.py
 
 # Re-trigger: PR #684 head updated with fixes (c7a0956d); confirm compiler.py regression now passes.
+
+# Re-trigger: PR #684 head 0753b115 with round-2 fixes (norm cleanup, dataset_order raise, VLM CE parity, scheduler test).

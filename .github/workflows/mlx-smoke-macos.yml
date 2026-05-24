@@ -117,3 +117,5 @@ jobs:
           if-no-files-found: ignore
 
 # Re-trigger: confirm MLX smoke still passes on PR #684 head c7a0956d after four fixes.
+
+# Re-trigger: PR #684 head 0753b115 with round-2 fixes; confirm MLX smoke still green.
