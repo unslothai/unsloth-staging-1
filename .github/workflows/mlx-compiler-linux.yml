@@ -1,0 +1,98 @@
+name: MLX PR validation - compiler.py regression (Linux)
+
+# Validates that unsloth-zoo PR #684 (mmathew23/explore/mlx) reverts the
+# UNSLOTH_RETURN_LOGITS=1 dedicated elif branch that PR #666 added to
+# `unsloth_zoo/compiler.py:cross_entropy_replacement_2`. Runs on a CPU
+# Linux runner with the standard unsloth CUDA spoof (no GPU required).
+
+on:
+  push:
+    branches: [mlx-matthew-validation]
+    paths:
+      - .github/workflows/mlx-compiler-linux.yml
+      - tests/staging_validation/test_compiler_return_logits.py
+  workflow_dispatch:
+
+concurrency:
+  group: mlx-compiler-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  compiler-template-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        zoo-ref:
+          # main = control: expect dedicated elif present  -> PASS
+          # mmathew23:explore/mlx = PR #684: expect missing -> FAIL (the regression)
+          - {label: main,                          repo: unslothai/unsloth-zoo,  ref: main}
+          - {label: 'pr-684 (explore/mlx)',        repo: mmathew23/unsloth-zoo, ref: explore/mlx}
+    name: zoo=${{ matrix.zoo-ref.label }}
+    steps:
+      - name: Checkout staging repo (for tests/)
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install CPU torch + transformers + pytest
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch keeps the Linux runner light. unsloth-zoo's
+          # device_type @cache captures "cuda" via the spoof at import.
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu \
+            'torch==2.6.0+cpu'
+          python -m pip install \
+            'transformers==4.57.6' \
+            'numpy<3' \
+            'regex' \
+            'pytest'
+
+      - name: Install unsloth-zoo @ ${{ matrix.zoo-ref.label }}
+        run: |
+          python -m pip install --no-deps --force-reinstall \
+            "git+https://github.com/${{ matrix.zoo-ref.repo }}@${{ matrix.zoo-ref.ref }}"
+
+      - name: Show installed compiler.py SHA-line context
+        run: |
+          python - <<'PY'
+          import inspect, unsloth_zoo.compiler as c
+          src = inspect.getsource(c)
+          for needle in ["cross_entropy_replacement_2 =", "# UNSLOTH_RETURN_LOGITS=1 path.", "Prepended `logits = self.lm_head"]:
+              idx = src.find(needle)
+              print(f"{needle!r:55s} -> index {idx}")
+          PY
+
+      - name: Run compiler.py regression check
+        run: |
+          # On the PR head this is expected to FAIL (the regression).
+          # On main this is expected to PASS.
+          set +e
+          python -m pytest -x -v tests/staging_validation/test_compiler_return_logits.py
+          rc=$?
+          echo "pytest exit = $rc"
+          # Encode "expected fail on PR head, expected pass on main" into the
+          # job exit code so the run is green when reality matches expectation.
+          case "${{ matrix.zoo-ref.label }}" in
+            main)
+              if [ "$rc" -ne 0 ]; then
+                echo "::error::main is expected to PASS this regression check but FAILED."
+                exit 1
+              fi
+              echo "::notice::main PASSES the regression check (dedicated elif present)." ;;
+            *pr-684*)
+              if [ "$rc" -eq 0 ]; then
+                echo "::error::pr-684 is expected to FAIL this regression check but PASSED. The PR may have been amended; please re-confirm."
+                exit 1
+              fi
+              echo "::notice::pr-684 FAILS the regression check (dedicated elif removed). Regression confirmed." ;;
+            *)
+              exit "$rc" ;;
+          esac

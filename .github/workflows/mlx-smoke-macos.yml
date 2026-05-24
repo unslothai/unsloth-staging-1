@@ -1,0 +1,112 @@
+name: MLX PR validation - real MLX smoke (macOS-14)
+
+# Runs the 30-step real MLX smoke from unsloth PR #5656 against the
+# combined PRs (unsloth-zoo PR #684 + unsloth PR #5656) on a real
+# Apple Silicon runner. This is the canonical signal for PR #5656's
+# smoke refresh and PR #684's MLX trainer changes.
+
+on:
+  push:
+    branches: [mlx-matthew-validation]
+    paths:
+      - .github/workflows/mlx-smoke-macos.yml
+  workflow_dispatch:
+
+concurrency:
+  group: mlx-smoke-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  real-mlx-smoke:
+    # macos-14 is M1 Apple Silicon (free for public repos). Studio MLX
+    # worker + unsloth_zoo.mlx.* import `mlx.core` which requires
+    # Apple Silicon, so this runner is mandatory.
+    runs-on: macos-14
+    timeout-minutes: 60
+    env:
+      HF_HOME: ${{ github.workspace }}/.hf_cache
+      TOKENIZERS_PARALLELISM: 'false'
+      PYTHONUNBUFFERED: '1'
+
+    steps:
+      - name: Verify Apple Silicon
+        run: |
+          uname -m
+          uname -s
+          test "$(uname -s)-$(uname -m)" = "Darwin-arm64"
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Clone unsloth PR #5656 head (mmathew23/explore/mlx)
+        run: |
+          git clone --depth=1 --branch explore/mlx https://github.com/mmathew23/unsloth.git unsloth-pr5656
+          git -C unsloth-pr5656 log -1 --oneline
+
+      - name: Install MLX wheels + base deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            'torch==2.6.0' \
+            'transformers==4.57.6' \
+            'numpy<3' \
+            'safetensors' \
+            'regex' \
+            'pytest' \
+            'mlx>=0.20.0' \
+            'mlx-lm>=0.20.0' \
+            'mlx-vlm>=0.1.0' \
+            'huggingface_hub' \
+            'datasets'
+
+      - name: Install unsloth-zoo PR #684 head (mmathew23/explore/mlx)
+        run: |
+          python -m pip install --no-deps --force-reinstall \
+            'git+https://github.com/mmathew23/unsloth-zoo@explore/mlx'
+
+      - name: Install unsloth PR #5656 head (editable)
+        run: |
+          python -m pip install --no-deps -e ./unsloth-pr5656
+
+      - name: Show installed versions
+        run: |
+          python - <<'PY'
+          import importlib, sys
+          for mod in ("torch","mlx","mlx.core","mlx_lm","mlx_vlm","transformers","unsloth","unsloth_zoo"):
+              try:
+                  m = importlib.import_module(mod)
+                  v = getattr(m, "__version__", "n/a")
+                  loc = getattr(m, "__file__", "n/a")
+                  print(f"{mod:20s}  v={v}  @ {loc}")
+              except Exception as e:
+                  print(f"{mod:20s}  IMPORT_ERROR: {e}")
+          PY
+
+      - name: Run 30-step real MLX smoke (train subcommand)
+        working-directory: unsloth-pr5656
+        run: |
+          # tests/studio/run_real_mlx_smoke.py was refreshed by PR #5656
+          # to assert len(losses_per_step) == config.max_steps (30 by
+          # default, set by PR #5537 of unsloth main).
+          python -u tests/studio/run_real_mlx_smoke.py train
+
+      - name: Run 30-step real MLX smoke (eval subcommand)
+        working-directory: unsloth-pr5656
+        run: |
+          # Eval gate verifies the post-train completion contains "Unsloth".
+          python -u tests/studio/run_real_mlx_smoke.py eval || true
+
+      - name: Upload smoke output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-mlx-smoke-fail-${{ github.run_id }}
+          path: |
+            unsloth-pr5656/**/*.log
+            unsloth-pr5656/tests/studio/out_*.txt
+          if-no-files-found: ignore
