@@ -115,3 +115,5 @@ jobs:
             unsloth-pr5656/**/*.log
             unsloth-pr5656/tests/studio/out_*.txt
           if-no-files-found: ignore
+
+# Re-trigger: confirm MLX smoke still passes on PR #684 head c7a0956d after four fixes.

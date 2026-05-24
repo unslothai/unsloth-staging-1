@@ -91,3 +91,5 @@ jobs:
             *)
               exit "$rc" ;;
           esac
+
+# Re-trigger: PR #684 head updated with fixes (c7a0956d); confirm compiler.py regression now passes.

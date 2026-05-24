@@ -131,3 +131,5 @@ jobs:
           # backend (matplotlib, structlog, asyncio etc.) which we
           # do not need for the schema check above.
           python -m pytest -x -v tests/test_mlx_training_worker_config.py
+
+# Re-trigger: confirm Windows schema check still passes on PR #5656 head bff5b443.
