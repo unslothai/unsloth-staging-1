@@ -137,3 +137,5 @@ jobs:
 # Re-trigger: PR #5656 head bff5b443 with present-but-None seed fix; confirm Windows schema still green.
 
 # Re-trigger: PR #5656 head 56e32b75 with feature-detect MLXTrainingConfig + random_seed normalize; confirm Windows schema still green.
+
+# Re-trigger: PR #5656 head 1a026435 (round-3 P1: seed/cast/grad-value normalize at TrainingBackend; bump schema seed default).
