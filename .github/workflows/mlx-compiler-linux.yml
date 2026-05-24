@@ -80,3 +80,5 @@ jobs:
 # Re-trigger: PR #684 head 4cb6ca66 (round-2 P1: cross-epoch refill, baseline mask off-by-one, append_eos plumbing, labeled-batches dataset_order honor).
 
 # Re-trigger: PR #684 head 6374bad6 (HF parity decay for SGD/Muon/Lion); confirm compiler regression still green.
+
+# Re-trigger: PR #684 head d16ef240 (round-3 P1/P2: elementwise max_grad_value, iterable VLM raise, Qwen3 vision flag restore, ordered batches pad token).
