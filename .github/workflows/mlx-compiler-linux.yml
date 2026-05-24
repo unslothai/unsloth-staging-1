@@ -67,29 +67,10 @@ jobs:
 
       - name: Run compiler.py regression check
         run: |
-          # On the PR head this is expected to FAIL (the regression).
-          # On main this is expected to PASS.
-          set +e
+          # Both legs must PASS now that the fix landed on
+          # mmathew23:explore/mlx (c7a0956d): the dedicated
+          # UNSLOTH_RETURN_LOGITS=1 elif from PR #666 (f45c31e5) is
+          # restored, so neither main nor the PR head should regress.
           python -m pytest -x -v tests/staging_validation/test_compiler_return_logits.py
-          rc=$?
-          echo "pytest exit = $rc"
-          # Encode "expected fail on PR head, expected pass on main" into the
-          # job exit code so the run is green when reality matches expectation.
-          case "${{ matrix.zoo-ref.label }}" in
-            main)
-              if [ "$rc" -ne 0 ]; then
-                echo "::error::main is expected to PASS this regression check but FAILED."
-                exit 1
-              fi
-              echo "::notice::main PASSES the regression check (dedicated elif present)." ;;
-            *pr-684*)
-              if [ "$rc" -eq 0 ]; then
-                echo "::error::pr-684 is expected to FAIL this regression check but PASSED. The PR may have been amended; please re-confirm."
-                exit 1
-              fi
-              echo "::notice::pr-684 FAILS the regression check (dedicated elif removed). Regression confirmed." ;;
-            *)
-              exit "$rc" ;;
-          esac
 
 # Re-trigger: PR #684 head updated with fixes (c7a0956d); confirm compiler.py regression now passes.
