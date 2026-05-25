@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+#
+# PR-5351 cross-OS validation: Windows lane.
+# windows-latest. Validates the multiprocessing `spawn` path
+# (mandatory on Windows), path normalisation, and EAGAIN-style
+# Process construction failures under load (the exact bug class the
+# semaphore-leak fix protects against). CPU-only; CUDA spoof
+# auto-engages via tests/conftest.py.
+
+name: PR-5351 Windows
+
+on:
+  push:
+    branches: [pr-5351-cross-os-validation]
+    paths:
+      - 'studio/backend/**'
+      - 'tests/studio/**'
+      - 'tests/conftest.py'
+      - '.github/workflows/pr5351-windows.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: pr5351-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install backend test dependencies (CPU only)
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt
+          pip install python-multipart aiofiles sqlalchemy cryptography pyyaml jinja2 mammoth unpdf requests "numpy<3" pytest pytest-asyncio httpx
+          pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.4,<2.11"
+          pip install "transformers>=4.51,<5.5"
+
+      - name: PR-5351 document tests (Windows spawn semantics)
+        working-directory: studio/backend
+        shell: pwsh
+        env:
+          UNSLOTH_STUDIO_EXTRACT_CONCURRENCY: '2'
+        run: |
+          python -m pytest -q tests/test_chat_document_extraction.py tests/test_chat_document_routes.py tests/test_inference_worker.py tests/test_vision_cache.py tests/test_anthropic_messages.py tests/test_openai_tool_passthrough.py tests/test_models_get_model_config_case_resolution.py --tb=short
+
+      - name: PR-5351 regression tests + cancel timing
+        shell: pwsh
+        run: |
+          python -m pytest -q tests/studio/test_extractor_semaphore_leak.py tests/studio/test_html_independent_of_inference.py tests/studio/test_gguf_singleton_shared.py tests/studio/test_stream_cancel_registration_timing.py --tb=short
