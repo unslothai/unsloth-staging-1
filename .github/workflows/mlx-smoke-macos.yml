@@ -106,6 +106,108 @@ jobs:
           # Eval gate verifies the post-train completion contains "Unsloth".
           python -u tests/studio/run_real_mlx_smoke.py eval --workdir "${{ github.workspace }}/mlx_smoke_workdir" || true
 
+      - name: Multi-epoch labeled-batch reseed runtime check (PR #684 `1d0c11ed`)
+        # Round-4 reviewers flagged that `_create_labeled_batches` with
+        # `dataset_order="torch_randperm"` did not reseed per epoch. The
+        # fix in `1d0c11ed` materializes `num_epochs` blocks of permuted
+        # batches with `seed + epoch_idx`. This step actually runs that
+        # code path against real MLX so the multi-epoch behavior is
+        # validated end-to-end rather than only by static review.
+        run: |
+          python - <<'PY'
+          import sys
+
+          # Reuse the same MLX-aware torch.randperm helper the trainer
+          # imports, exercising the real CPython-MLX install on the runner.
+          import mlx.core as mx  # noqa: F401  (proves MLX import works)
+          from unsloth_zoo.mlx.utils import _torch_randperm_order
+          from unsloth_zoo.mlx.trainer import _create_labeled_batches
+
+          class _DummyTok:
+              eos_token_id = 99
+              def __init__(self):
+                  self.pad_token_id = 0
+              def encode(self, text):
+                  # `i` decides row length so length-sort vs torch-perm
+                  # produce distinguishable orders.
+                  i = int(text.split("_")[-1])
+                  return [10 + j for j in range(2 + i)]
+
+          # Identity mask -- supervise every token. Just exercises plumbing.
+          def _mask(item):
+              ids = item["input_ids"][0]
+              return {"labels": [list(ids)]}
+
+          ds = [{"text": f"row_{i}"} for i in range(6)]
+          BS = 2
+          SEED = 3407
+          NUM_EPOCHS = 3
+
+          # Avoid the chat-template normalize path by passing model_type=None.
+          batches = _create_labeled_batches(
+              dataset=ds,
+              tokenizer=_DummyTok(),
+              mask_fn=_mask,
+              batch_size=BS,
+              max_seq_length=64,
+              seed=SEED,
+              dataset_order="torch_randperm",
+              preserve_dataset_order=False,
+              num_epochs=NUM_EPOCHS,
+              append_eos=False,
+          )
+
+          batches_per_epoch = (len(ds) + BS - 1) // BS
+          expected_total = batches_per_epoch * NUM_EPOCHS
+          assert len(batches) == expected_total, (
+              f"want {expected_total} batches across {NUM_EPOCHS} epochs, "
+              f"got {len(batches)}"
+          )
+
+          # Reconstruct each epoch's expected sample order from the same
+          # _torch_randperm_order(len, seed+epoch_idx) call the trainer makes,
+          # then assert the row ids inside the materialized batches line up.
+          def _row_id_of(batch_tensor, sample_idx):
+              # encode("row_i") emits [10, 11, ..., 10 + (1+i)], so id 10
+              # appears at position 0 and the row index is `length - 2`.
+              row_len = int(batch_tensor.shape[1])
+              # find the trailing pad to recover real length:
+              ids = batch_tensor[sample_idx].tolist()
+              # pad id is 0; the encoder never emits 0
+              while ids and ids[-1] == 0:
+                  ids.pop()
+              return len(ids) - 2
+
+          observed_per_epoch = []
+          for epoch_idx in range(NUM_EPOCHS):
+              epoch_rows = []
+              start = epoch_idx * batches_per_epoch
+              for b in batches[start : start + batches_per_epoch]:
+                  batch_arr, _, _ = b
+                  for s in range(batch_arr.shape[0]):
+                      epoch_rows.append(_row_id_of(batch_arr, s))
+              observed_per_epoch.append(epoch_rows)
+
+          for epoch_idx, observed in enumerate(observed_per_epoch):
+              expected = _torch_randperm_order(len(ds), SEED + epoch_idx)
+              assert observed == expected, (
+                  f"epoch {epoch_idx}: want {expected}, got {observed}"
+              )
+
+          # Epoch 0 and epoch 1 must NOT be identical orders, otherwise the
+          # per-epoch reseed is silently broken (this is what the round-4
+          # reviewer pass would have re-flagged as a P1).
+          assert observed_per_epoch[0] != observed_per_epoch[1], (
+              f"epoch 0 == epoch 1 ({observed_per_epoch[0]}) -- per-epoch "
+              "reseed is not actually firing"
+          )
+
+          print("OK: _create_labeled_batches num_epochs=3 torch_randperm")
+          print("epoch 0 order:", observed_per_epoch[0])
+          print("epoch 1 order:", observed_per_epoch[1])
+          print("epoch 2 order:", observed_per_epoch[2])
+          PY
+
       - name: Upload smoke output on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -131,3 +233,5 @@ jobs:
 # Re-trigger: PR #684 head 8c278327 (restore mask = kwargs.get in 4 VLM patched functions broken by round-3 ruff cleanup).
 
 # Re-trigger: PR #684 head 1d0c11ed (round-4 multi-epoch labeled batch reseed for torch_randperm parity).
+
+# Re-trigger: extend macOS smoke with a real-MLX multi-epoch labeled-batch reseed assertion (was only static review before).
