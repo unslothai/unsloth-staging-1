@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Staging-only CI: diffusion backend tests on macOS 14 (Apple Silicon).
+# Confirms the Pillow / Pydantic / FastAPI import surface works the
+# same on darwin-arm64 as on Linux. No GPU; we stub diffusers.
+
+name: Diffusion backend (macOS)
+
+on:
+  push:
+    branches: [studio-diffusion-images-staging]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: macos-14
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+      - name: Install minimal backend test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-asyncio httpx fastapi pydantic structlog \
+                      pillow loguru python-multipart aiofiles sqlalchemy \
+                      cryptography pyyaml jinja2 'numpy<3' requests
+          pip install -r studio/backend/requirements/studio.txt
+          # PyTorch wheels for macOS-arm64 come from the default PyPI
+          # index; CPU/MPS is fine since the tests stub the pipeline.
+          pip install 'torch>=2.4,<2.11'
+      - name: Run diffusion backend + route tests
+        working-directory: studio/backend
+        run: |
+          python -m pytest tests/test_diffusion_backend.py tests/test_diffusion_routes.py -v --tb=short
