@@ -208,6 +208,98 @@ jobs:
           print("epoch 2 order:", observed_per_epoch[2])
           PY
 
+      - name: SGD / Muon / Lion HF parity decay runtime check (PR #684 `6374bad6`)
+        # Round-2 reviewer pass flagged that the AdamW manual decoupled
+        # decay was not applied to SGD / Muon / Lion. `6374bad6` widened
+        # `_apply_manual_weight_decay` to cover all four optimizers and
+        # zeroed out the underlying MLX optimizer's `weight_decay`. This
+        # exercises that wiring on real MLX so a future revert (or a
+        # new optimizer added to the dispatch table) fails loudly.
+        run: |
+          python - <<'PY'
+          import mlx.optimizers as optim
+          from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+          class _DummyModel:
+              def trainable_parameters(self):
+                  return {}
+
+          for opt_name in ("sgd", "muon", "lion", "adamw"):
+              trainer = MLXTrainer.__new__(MLXTrainer)
+              trainer.model = _DummyModel()
+              trainer.args = MLXTrainingConfig(
+                  optim=opt_name,
+                  weight_decay=0.05,
+              )
+              optimizer = trainer._build_optimizer(total_steps=4)
+              wd = getattr(trainer, "_manual_weight_decay", None)
+              assert wd is not None and abs(wd - 0.05) < 1e-9, (
+                  f"{opt_name}: manual decay scalar = {wd!r}, want 0.05"
+              )
+              internal = None
+              if hasattr(optimizer, "_kw"):
+                  internal = optimizer._kw.get("weight_decay")
+              elif hasattr(optimizer, "weight_decay"):
+                  internal = float(optimizer.weight_decay)
+              if internal is not None:
+                  assert abs(float(internal)) < 1e-12, (
+                      f"{opt_name}: optimizer.weight_decay = {internal!r}, "
+                      "must be 0 so the manual decoupled decay owns the term"
+                  )
+              print(f"OK {opt_name}: manual_wd=0.05  optim_wd={internal}")
+
+          # Bias / norm exclusion contract.
+          assert MLXTrainer._should_apply_weight_decay("layers.0.mlp.weight")
+          assert not MLXTrainer._should_apply_weight_decay("layers.0.mlp.bias")
+          assert not MLXTrainer._should_apply_weight_decay("layers.0.input_layernorm.weight")
+          assert not MLXTrainer._should_apply_weight_decay("transformer.h.0.ln_1.weight")
+          print("OK: HF bias / norm / GPT-2 ln_* exclusion filter")
+          PY
+
+      - name: VLM train_on_completions prompt masking runtime check (PR #684 `23751c84`)
+        # Round-3 reviewer pass: `_collate_vlm_batch` now always sets
+        # `batch["labels"]`, so `_vlm_cce_forward` and
+        # `make_vlm_baseline_loss_fn` always take their labels-aware
+        # branch. The labels-aware branch was missing the
+        # `_mask_prompt_tokens(...)` call that the labels=None branch
+        # already performed, so `train_on_completions=True` silently
+        # trained on prompt tokens. `23751c84` added the call to both
+        # branches. This step runs the masking helpers against synthetic
+        # labels on real MLX and asserts prompt tokens become -100.
+        run: |
+          python - <<'PY'
+          import mlx.core as mx
+          from unsloth_zoo.mlx.utils import _mask_prompt_tokens
+
+          # Two sequences. Prompt = before assistant_token_id (= 7),
+          # response = from assistant_token_id onward. -100 means
+          # "do not train on this position".
+          targets = mx.array([
+              [1, 2, 3, 7, 8, 9],   # prompt=[1,2,3], assistant marker at idx 3, response=[8,9]
+              [4, 5, 7, 6, 6, 6],   # prompt=[4,5], assistant marker at idx 2, response=[6,6,6]
+          ], dtype=mx.int32)
+
+          masked = _mask_prompt_tokens(targets, assistant_token_id=7)
+          observed = masked.tolist()
+          expected = [
+              [-100, -100, -100, 7, 8, 9],
+              [-100, -100, 7, 6, 6, 6],
+          ]
+          assert observed == expected, (
+              f"_mask_prompt_tokens regressed.\n"
+              f"got      {observed}\n"
+              f"expected {expected}"
+          )
+
+          # assistant_token_id <= 0 must be a no-op (train_on_completions=False).
+          no_marker = _mask_prompt_tokens(targets, assistant_token_id=0)
+          assert no_marker.tolist() == targets.tolist(), (
+              "assistant_token_id=0 should not mutate targets"
+          )
+
+          print("OK: _mask_prompt_tokens correctly masks prompt tokens before assistant marker")
+          PY
+
       - name: Upload smoke output on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -235,3 +327,5 @@ jobs:
 # Re-trigger: PR #684 head 1d0c11ed (round-4 multi-epoch labeled batch reseed for torch_randperm parity).
 
 # Re-trigger: extend macOS smoke with a real-MLX multi-epoch labeled-batch reseed assertion (was only static review before).
+
+# Re-trigger: extend macOS smoke with two more real-MLX assertions (SGD/Muon/Lion HF parity decay + VLM train_on_completions prompt masking).
