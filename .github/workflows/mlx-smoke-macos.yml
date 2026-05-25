@@ -300,6 +300,69 @@ jobs:
           print("OK: _mask_prompt_tokens correctly masks prompt tokens before assistant marker")
           PY
 
+      - name: create_ordered_batches cross-epoch refill runtime check (PR #684 `4cb6ca66`)
+        # Round-2 reviewer pass: pre-fix `create_ordered_batches` filled
+        # short tail batches with samples from the next epoch in the same
+        # micro-batch, mixing epoch 0 and epoch 1 indices. The fix takes
+        # a contiguous slice from the current epoch order and emits a
+        # partial batch when the tail is short. Run on real MLX so the
+        # fix is verified end-to-end rather than only by static review.
+        run: |
+          python - <<'PY'
+          from unsloth_zoo.mlx.utils import create_ordered_batches
+
+          class _Tok:
+              eos_token_id = 99
+              pad_token_id = 0
+              def encode(self, text):
+                  return [10 + int(text.split("_")[-1]) + j for j in range(3)]
+
+          ds = [{"text": f"r_{i}"} for i in range(5)]
+          BS = 3
+          NUM_EPOCHS = 2
+
+          batches = create_ordered_batches(
+              dataset=ds,
+              tokenizer=_Tok(),
+              batch_size=BS,
+              max_seq_length=32,
+              num_batches=None,
+              seed=3407,
+              dataset_order="sequential",
+              num_epochs=NUM_EPOCHS,
+              append_eos=False,
+          )
+
+          def _row_id(batch_arr, sample_idx):
+              ids = batch_arr[sample_idx].tolist()
+              while ids and ids[-1] == 0:
+                  ids.pop()
+              # encode("r_i") = [10 + i, 11 + i, 12 + i] so subtract 10
+              return ids[0] - 10
+
+          for b_idx, (batch_arr, _, _) in enumerate(batches):
+              rows = [_row_id(batch_arr, s) for s in range(batch_arr.shape[0])]
+              # In sequential order with 5 samples and BS=3, epoch 0 must
+              # emit [0,1,2] and [3,4]; epoch 1 must emit [0,1,2] and [3,4]
+              # again. No batch may span epoch boundaries.
+              assert max(rows) - min(rows) < len(ds), (
+                  f"batch {b_idx} rows {rows} span epoch boundary"
+              )
+              # Specifically: no batch should contain {3,4} mixed with {0}.
+              # Pre-fix output for this dataset was [[0,1,2],[3,4,0],[1,2,3],[4]]
+              # where [3,4,0] crosses epoch 0 -> epoch 1.
+              first, last = min(rows), max(rows)
+              assert not (first < 3 and last >= 3), (
+                  f"batch {b_idx} {rows} mixes epoch 0 tail (3,4) with "
+                  "epoch 1 head (0,1,2)"
+              )
+
+          assert len(batches) == 4, (
+              f"want 4 batches ([[0,1,2],[3,4]] x 2 epochs), got {len(batches)}"
+          )
+          print(f"OK: create_ordered_batches num_epochs=2 BS=3 ds=5 yields {len(batches)} non-mixing batches")
+          PY
+
       - name: Upload smoke output on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -329,3 +392,5 @@ jobs:
 # Re-trigger: extend macOS smoke with a real-MLX multi-epoch labeled-batch reseed assertion (was only static review before).
 
 # Re-trigger: extend macOS smoke with two more real-MLX assertions (SGD/Muon/Lion HF parity decay + VLM train_on_completions prompt masking).
+
+# Re-trigger: extend macOS smoke with create_ordered_batches cross-epoch refill assertion (round-2 P1).
