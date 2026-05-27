@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+#
+# PR-5351 CPU-inference cross-OS lane: Ubuntu.
+# Builds llama-cpp-python from source for CPU, downloads a 0.5B GGUF
+# from HF, extracts a synthetic PDF via the PR's document extractor,
+# and asserts the model answers a ground-truth question. Proves
+# end-to-end document-attach -> extract -> inference works on a CPU
+# runner with no GPU.
+
+name: PR-5351 CPU inference Ubuntu
+
+on:
+  push:
+    branches: [pr-5351-cross-os-validation]
+    paths:
+      - 'studio/backend/core/chat/**'
+      - 'tests/studio/test_cpu_inference_on_extracted_document.py'
+      - '.github/workflows/pr5351-cpu-inference-ubuntu.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: pr5351-cpu-inference-ubuntu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu-inference:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install backend + llama-cpp-python (CPU build)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt
+          pip install \
+            python-multipart aiofiles sqlalchemy cryptography \
+            pyyaml jinja2 mammoth pymupdf pymupdf4llm pytest pytest-asyncio \
+            pytest-timeout huggingface_hub requests numpy
+          # CPU wheel ships pre-built on Linux; falls back to source if needed.
+          CMAKE_ARGS="-DGGML_NATIVE=OFF" pip install --upgrade --quiet llama-cpp-python
+
+      - name: CPU inference on extracted document
+        env:
+          PR5351_LLAMA_THREADS: '4'
+        run: |
+          python -m pytest -q tests/studio/test_cpu_inference_on_extracted_document.py -s --tb=short

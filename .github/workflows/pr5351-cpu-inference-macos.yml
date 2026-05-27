@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+#
+# PR-5351 CPU-inference cross-OS lane: macOS (Apple Silicon).
+# Same as the Ubuntu lane but on macos-14. llama-cpp-python builds
+# with Metal autodetect disabled to stay on the CPU code path so the
+# result mirrors a non-GPU Mac.
+
+name: PR-5351 CPU inference macOS
+
+on:
+  push:
+    branches: [pr-5351-cross-os-validation]
+    paths:
+      - 'studio/backend/core/chat/**'
+      - 'tests/studio/test_cpu_inference_on_extracted_document.py'
+      - '.github/workflows/pr5351-cpu-inference-macos.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: pr5351-cpu-inference-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu-inference:
+    runs-on: macos-14
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install backend + llama-cpp-python (CPU build)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt
+          pip install \
+            python-multipart aiofiles sqlalchemy cryptography \
+            pyyaml jinja2 mammoth pymupdf pymupdf4llm pytest pytest-asyncio \
+            pytest-timeout huggingface_hub requests numpy
+          # Disable Metal so the lane stays CPU-only; mirrors a no-GPU Mac.
+          CMAKE_ARGS="-DGGML_METAL=OFF -DGGML_ACCELERATE=OFF -DGGML_NATIVE=OFF" \
+            pip install --upgrade --quiet llama-cpp-python
+
+      - name: CPU inference on extracted document
+        env:
+          PR5351_LLAMA_THREADS: '3'
+        run: |
+          python -m pytest -q tests/studio/test_cpu_inference_on_extracted_document.py -s --tb=short

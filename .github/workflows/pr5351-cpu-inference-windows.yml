@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+#
+# PR-5351 CPU-inference cross-OS lane: Windows.
+# llama-cpp-python wheels exist for Windows; if pip falls back to
+# source, MSVC is preinstalled on windows-latest. CPU-only.
+
+name: PR-5351 CPU inference Windows
+
+on:
+  push:
+    branches: [pr-5351-cross-os-validation]
+    paths:
+      - 'studio/backend/core/chat/**'
+      - 'tests/studio/test_cpu_inference_on_extracted_document.py'
+      - '.github/workflows/pr5351-cpu-inference-windows.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: pr5351-cpu-inference-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu-inference:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install backend + llama-cpp-python (CPU build)
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt
+          pip install python-multipart aiofiles sqlalchemy cryptography pyyaml jinja2 mammoth pymupdf pymupdf4llm pytest pytest-asyncio pytest-timeout huggingface_hub requests numpy
+          $env:CMAKE_ARGS = "-DGGML_NATIVE=OFF"
+          pip install --upgrade --quiet llama-cpp-python
+
+      - name: CPU inference on extracted document
+        shell: pwsh
+        env:
+          PR5351_LLAMA_THREADS: '4'
+        run: |
+          python -m pytest -q tests/studio/test_cpu_inference_on_extracted_document.py -s --tb=short
