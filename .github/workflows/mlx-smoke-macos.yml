@@ -421,6 +421,116 @@ jobs:
                 "preserves leaf direction")
           PY
 
+      - name: max_grad_leaf_norm 30-step training parity run (CUDA cross-check)
+        working-directory: unsloth-pr5656
+        # Run the same gemma-3-270m memorisation training as the existing
+        # smoke but with the new max_grad_leaf_norm=1.0 clip path instead
+        # of max_grad_value=1.0. Dump per-step losses to a JSON the B200
+        # CUDA reference run can be overlaid against. Mirrors
+        # tests/studio/run_real_mlx_smoke.py train but uses the
+        # proportional clip default.
+        run: |
+          python -u - <<'PY'
+          import json, math, os, random
+          from pathlib import Path
+          import numpy as np
+          import mlx.core as mx
+          from unsloth_zoo.mlx.loader import FastMLXModel
+          from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+          SEED = 3407
+          TRAIN_TEXT = "<<HELLO!!>> My name is Unsloth!"
+          MODEL_NAME = "unsloth/gemma-3-270m-it"
+
+          random.seed(SEED); np.random.seed(SEED); mx.random.seed(SEED)
+
+          model, tokenizer = FastMLXModel.from_pretrained(
+              MODEL_NAME,
+              load_in_4bit=False,
+              dtype="float16",
+              text_only=True,
+              max_seq_length=128,
+              random_state=SEED,
+              token=os.environ.get("HF_TOKEN") or None,
+              trust_remote_code=False,
+          )
+          mx.random.seed(SEED)
+          model = FastMLXModel.get_peft_model(
+              model, r=8, lora_alpha=16, lora_dropout=0.0,
+              target_modules=["q_proj","k_proj","v_proj","o_proj",
+                              "gate_proj","up_proj","down_proj"],
+              use_gradient_checkpointing=False, random_state=SEED,
+              finetune_language_layers=True,
+              finetune_attention_modules=True,
+              finetune_mlp_modules=True,
+          )
+
+          # Same config as run_real_mlx_smoke.py but with the new clip path.
+          config = MLXTrainingConfig(
+              per_device_train_batch_size=2,
+              gradient_accumulation_steps=3,
+              max_steps=30,
+              learning_rate=1e-3,
+              warmup_steps=0,
+              lr_scheduler_type="constant",
+              optim="adamw",
+              weight_decay=0.0,
+              max_grad_norm=0.0,
+              max_grad_value=None,             # disable elementwise
+              max_grad_leaf_norm=1.0,          # NEW: proportional per-leaf L2
+              logging_steps=1,
+              max_seq_length=64,
+              seed=SEED,
+              use_cce=False,
+              compile=False,
+              gradient_checkpointing=False,
+              output_dir="leaf_norm_outputs",
+              save_steps=0,
+              eval_steps=0,
+              dataset_text_field="text",
+          )
+          trainer = MLXTrainer(
+              model=model, tokenizer=tokenizer,
+              train_dataset=[{"text": TRAIN_TEXT}] * 64,
+              args=config,
+          )
+
+          steps = []
+          def _on_step(step, total, loss, lr, tok_s, peak_gb, elapsed,
+                       num_tokens, grad_norm=None):
+              steps.append({
+                  "step": step,
+                  "loss": round(float(loss), 4),
+                  "grad_norm": round(float(grad_norm), 4) if grad_norm is not None else None,
+              })
+              gn = f"  grad={grad_norm:.4f}" if grad_norm is not None else ""
+              print(f"  leaf_norm step {step}/{total}  loss={loss:.4f}{gn}",
+                    flush=True)
+
+          trainer.add_step_callback(_on_step)
+          trainer.train()
+
+          assert len(steps) == 30, f"expected 30 steps got {len(steps)}"
+          payload = {
+              "clip_mode": "max_grad_leaf_norm",
+              "threshold": 1.0,
+              "model": MODEL_NAME,
+              "seed": SEED,
+              "steps": steps,
+          }
+          Path("mlx_leaf_norm_losses.json").write_text(json.dumps(payload, indent=2))
+          print("WROTE mlx_leaf_norm_losses.json")
+          print(f"final loss: {steps[-1]['loss']}; first 8: "
+                f"{[s['loss'] for s in steps[:8]]}")
+          PY
+
+      - name: Upload max_grad_leaf_norm losses JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlx-leaf-norm-losses-${{ github.run_id }}
+          path: unsloth-pr5656/mlx_leaf_norm_losses.json
+          if-no-files-found: error
+
       - name: Upload smoke output on failure
         if: failure()
         uses: actions/upload-artifact@v4
