@@ -363,6 +363,64 @@ jobs:
           print(f"OK: create_ordered_batches num_epochs=2 BS=3 ds=5 yields {len(batches)} non-mixing batches")
           PY
 
+      - name: max_grad_leaf_norm runtime check (PR #684 `f545a00`)
+        # Verify the proportional per-leaf L2 clip path executes on real MLX,
+        # not just under the simulation shim. Builds two leaves with norms
+        # 0.5 and 3.0, then asserts that with max_grad_leaf_norm=1.0 the
+        # 0.5-norm leaf is untouched and the 3.0-norm leaf is rescaled to
+        # norm ~ 1.0 (direction preserved per leaf). Also checks the four
+        # mode strings returned by _resolve_mlx_grad_clipping.
+        run: |
+          python - <<'PY'
+          import mlx.core as mx
+          from unsloth_zoo.mlx.trainer import (
+              MLXTrainingConfig,
+              _resolve_mlx_grad_clipping,
+              _clip_grad_by_leaf_norm,
+          )
+
+          # 1. Mode dispatch
+          cfg_default = MLXTrainingConfig(output_dir="/tmp/x")
+          _, _, mgln, mode = _resolve_mlx_grad_clipping(cfg_default)
+          assert mode == "leaf_norm" and mgln == 1.0, (
+              f"default mode/threshold: got {mode!r}/{mgln}"
+          )
+
+          cfg_leaf = MLXTrainingConfig(max_grad_leaf_norm=2.5, output_dir="/tmp/x")
+          mgn, mgv, mgln, mode = _resolve_mlx_grad_clipping(cfg_leaf)
+          assert mode == "leaf_norm" and mgln == 2.5 and mgv == 0.0 and mgn == 0.0
+
+          cfg_value = MLXTrainingConfig(max_grad_value=1.5, output_dir="/tmp/x")
+          mgn, mgv, mgln, mode = _resolve_mlx_grad_clipping(cfg_value)
+          assert mode == "value" and mgv == 1.5 and mgln == 0.0 and mgn == 0.0
+
+          cfg_global = MLXTrainingConfig(max_grad_norm=1.0, output_dir="/tmp/x")
+          mgn, mgv, mgln, mode = _resolve_mlx_grad_clipping(cfg_global)
+          assert mode == "global_norm" and mgn == 1.0
+
+          # 2. Per-leaf rescale math: leaf with norm 3.0 capped at 1.0,
+          #    leaf with norm 0.5 left alone, both preserved in direction.
+          big = mx.array([3.0, 0.0, 0.0, 0.0], dtype=mx.float32)        # ||.|| = 3
+          small = mx.array([0.3, 0.4, 0.0, 0.0], dtype=mx.float32)      # ||.|| = 0.5
+          grad = {"big": big, "small": small}
+          clipped = _clip_grad_by_leaf_norm(grad, 1.0)
+
+          big_clip = clipped["big"]
+          small_clip = clipped["small"]
+          big_norm = float(mx.sqrt(mx.sum(big_clip * big_clip)).item())
+          small_norm = float(mx.sqrt(mx.sum(small_clip * small_clip)).item())
+          assert abs(big_norm - 1.0) < 1e-4, f"big leaf norm: {big_norm}"
+          assert abs(small_norm - 0.5) < 1e-4, f"small leaf norm: {small_norm}"
+
+          # Direction preservation: big_clip should be 1/3 * big (scalar rescale).
+          ratio = float(big_clip[0].item()) / float(big[0].item())
+          assert abs(ratio - 1.0 / 3.0) < 1e-4, f"big leaf scale: {ratio}"
+
+          print("OK: max_grad_leaf_norm modes resolve correctly; "
+                "per-leaf L2 rescale clips 3.0 -> 1.0, leaves 0.5 alone, "
+                "preserves leaf direction")
+          PY
+
       - name: Upload smoke output on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -392,5 +450,7 @@ jobs:
 # Re-trigger: extend macOS smoke with a real-MLX multi-epoch labeled-batch reseed assertion (was only static review before).
 
 # Re-trigger: extend macOS smoke with two more real-MLX assertions (SGD/Muon/Lion HF parity decay + VLM train_on_completions prompt masking).
+
+# Re-trigger: extend macOS smoke with max_grad_leaf_norm real-MLX assertion (PR #684 f545a00 proportional per-leaf clip).
 
 # Re-trigger: extend macOS smoke with create_ordered_batches cross-epoch refill assertion (round-2 P1).
