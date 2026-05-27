@@ -1,0 +1,141 @@
+name: MLX PR validation - install smoke (Windows)
+
+# Windows path coverage for PRs #5656 / #684. Studio MLX worker is
+# never reached on Windows (no MLX), but we still want to confirm that
+# `import unsloth` survives end-to-end after the PR changes land, the
+# Pydantic schema in studio/backend/models/training.py accepts
+# max_grad_value / cast_norm_output_to_input_dtype, and the studio
+# backend tests that don't touch CUDA/MLX still pass.
+
+on:
+  push:
+    branches: [mlx-matthew-validation]
+    paths:
+      - .github/workflows/install-smoke-windows.yml
+  workflow_dispatch:
+
+concurrency:
+  group: install-smoke-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows-install:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      PYTHONUNBUFFERED: '1'
+
+    steps:
+      - name: Clone unsloth PR #5656 head (mmathew23/explore/mlx)
+        shell: bash
+        run: |
+          git clone --depth=1 --branch explore/mlx https://github.com/mmathew23/unsloth.git unsloth-pr5656
+          git -C unsloth-pr5656 log -1 --oneline
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install CPU torch + transformers + studio deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          # Use CPU torch wheel on Windows for the import smoke.
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu \
+            'torch==2.6.0+cpu'
+          python -m pip install \
+            'transformers==4.57.6' \
+            'numpy<3' \
+            'pydantic>=2' \
+            'fastapi' \
+            'starlette' \
+            'pytest' \
+            'regex' \
+            'datasets' \
+            'structlog' \
+            'httpx' \
+            'aiosqlite'
+          # The studio backend test modules import datasets at
+          # collection time and the training package pulls in
+          # structlog / httpx / aiosqlite via core/training/__init__.
+          # Install them so test collection completes.
+
+      - name: Install unsloth-zoo PR #684 head (mmathew23/explore/mlx)
+        shell: bash
+        run: |
+          python -m pip install --no-deps --force-reinstall \
+            'git+https://github.com/mmathew23/unsloth-zoo@explore/mlx'
+
+      - name: Install unsloth PR #5656 head (editable)
+        shell: bash
+        run: |
+          python -m pip install --no-deps -e ./unsloth-pr5656
+
+      - name: Pydantic schema accepts new fields
+        shell: bash
+        run: |
+          python - <<'PY'
+          # Import the Studio TrainingStartRequest pydantic model from
+          # the PR head and confirm the two new fields exist and accept
+          # the documented values without coercion to default.
+          import sys
+          sys.path.insert(0, 'unsloth-pr5656/studio/backend')
+          from models.training import TrainingStartRequest
+
+          common = dict(
+              model_name='unsloth/test',
+              training_type='LoRA/QLoRA',
+              format_type='alpaca',
+              hf_dataset='yahma/alpaca-cleaned',
+          )
+          req = TrainingStartRequest(
+              max_grad_value=None,
+              cast_norm_output_to_input_dtype=False,
+              **common,
+          )
+          assert req.max_grad_value is None, req.max_grad_value
+          assert req.cast_norm_output_to_input_dtype is False, req.cast_norm_output_to_input_dtype
+
+          req2 = TrainingStartRequest(
+              max_grad_value=0.3,
+              **common,
+          )
+          assert req2.max_grad_value == 0.3, req2.max_grad_value
+          assert req2.cast_norm_output_to_input_dtype is True, req2.cast_norm_output_to_input_dtype
+
+          # Confirm the two fields show up in the model's JSON schema with
+          # the expected types - that is what PR #5656 wires through to the
+          # FastAPI OpenAPI document.
+          schema = TrainingStartRequest.model_json_schema()
+          mgv = schema['properties']['max_grad_value']
+          cnd = schema['properties']['cast_norm_output_to_input_dtype']
+          assert any(t.get('type') == 'null' for t in mgv.get('anyOf', [])), mgv
+          assert cnd['type'] == 'boolean' and cnd['default'] is True, cnd
+          print('OK: max_grad_value + cast_norm_output_to_input_dtype plumb through pydantic correctly.')
+          PY
+
+      - name: Run studio backend tests that don't need GPU/MLX
+        shell: bash
+        working-directory: unsloth-pr5656/studio/backend
+        run: |
+          # test_mlx_training_worker_config.py is self-contained: it
+          # stubs out structlog/loggers/utils.* and reads worker.py
+          # as text. This is the right CI gate for PR #5656's
+          # max_grad_value / cast_norm_output_to_input_dtype /
+          # model_random_state wiring. Avoid test_training_raw_support
+          # in CI because it transitively imports the full studio
+          # backend (matplotlib, structlog, asyncio etc.) which we
+          # do not need for the schema check above.
+          python -m pytest -x -v tests/test_mlx_training_worker_config.py
+
+# Re-trigger: confirm Windows schema check still passes on PR #5656 head bff5b443.
+
+# Re-trigger: PR #5656 head bff5b443 with present-but-None seed fix; confirm Windows schema still green.
+
+# Re-trigger: PR #5656 head 56e32b75 with feature-detect MLXTrainingConfig + random_seed normalize; confirm Windows schema still green.
+
+# Re-trigger: PR #5656 head 1a026435 (round-3 P1: seed/cast/grad-value normalize at TrainingBackend; bump schema seed default).

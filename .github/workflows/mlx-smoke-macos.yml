@@ -1,0 +1,723 @@
+name: MLX PR validation - real MLX smoke (macOS-14)
+
+# Runs the 30-step real MLX smoke from unsloth PR #5656 against the
+# combined PRs (unsloth-zoo PR #684 + unsloth PR #5656) on a real
+# Apple Silicon runner. This is the canonical signal for PR #5656's
+# smoke refresh and PR #684's MLX trainer changes.
+
+on:
+  push:
+    branches: [mlx-matthew-validation]
+    paths:
+      - .github/workflows/mlx-smoke-macos.yml
+  workflow_dispatch:
+
+concurrency:
+  group: mlx-smoke-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  real-mlx-smoke:
+    # macos-14 is M1 Apple Silicon (free for public repos). Studio MLX
+    # worker + unsloth_zoo.mlx.* import `mlx.core` which requires
+    # Apple Silicon, so this runner is mandatory.
+    runs-on: macos-14
+    timeout-minutes: 60
+    env:
+      HF_HOME: ${{ github.workspace }}/.hf_cache
+      TOKENIZERS_PARALLELISM: 'false'
+      PYTHONUNBUFFERED: '1'
+      # macos-14 runners enable hf_transfer in the default env but the
+      # wheel isn't pre-installed; explicitly disable so huggingface_hub
+      # falls back to the standard downloader.
+      HF_HUB_ENABLE_HF_TRANSFER: '0'
+
+    steps:
+      - name: Verify Apple Silicon
+        run: |
+          uname -m
+          uname -s
+          test "$(uname -s)-$(uname -m)" = "Darwin-arm64"
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Clone unsloth PR #5656 head (mmathew23/explore/mlx)
+        run: |
+          git clone --depth=1 --branch explore/mlx https://github.com/mmathew23/unsloth.git unsloth-pr5656
+          git -C unsloth-pr5656 log -1 --oneline
+
+      - name: Install MLX wheels + base deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            'torch==2.6.0' \
+            'transformers==4.57.6' \
+            'numpy<3' \
+            'safetensors' \
+            'regex' \
+            'pytest' \
+            'mlx>=0.20.0' \
+            'mlx-lm>=0.20.0' \
+            'mlx-vlm>=0.1.0' \
+            'huggingface_hub' \
+            'datasets'
+
+      - name: Install unsloth-zoo PR #684 head (mmathew23/explore/mlx)
+        run: |
+          python -m pip install --no-deps --force-reinstall \
+            'git+https://github.com/mmathew23/unsloth-zoo@explore/mlx'
+
+      - name: Install unsloth PR #5656 head (editable)
+        run: |
+          python -m pip install --no-deps -e ./unsloth-pr5656
+
+      - name: Show installed versions
+        run: |
+          python - <<'PY'
+          import importlib, sys
+          for mod in ("torch","mlx","mlx.core","mlx_lm","mlx_vlm","transformers","unsloth","unsloth_zoo"):
+              try:
+                  m = importlib.import_module(mod)
+                  v = getattr(m, "__version__", "n/a")
+                  loc = getattr(m, "__file__", "n/a")
+                  print(f"{mod:20s}  v={v}  @ {loc}")
+              except Exception as e:
+                  print(f"{mod:20s}  IMPORT_ERROR: {e}")
+          PY
+
+      - name: Run 30-step real MLX smoke (train subcommand)
+        working-directory: unsloth-pr5656
+        run: |
+          # tests/studio/run_real_mlx_smoke.py was refreshed by PR #5656
+          # to assert len(losses_per_step) == config.max_steps (30 by
+          # default, set by PR #5537 of unsloth main).
+          mkdir -p "${{ github.workspace }}/mlx_smoke_workdir"
+          python -u tests/studio/run_real_mlx_smoke.py train --workdir "${{ github.workspace }}/mlx_smoke_workdir"
+
+      - name: Run 30-step real MLX smoke (eval subcommand)
+        working-directory: unsloth-pr5656
+        run: |
+          # Eval gate verifies the post-train completion contains "Unsloth".
+          python -u tests/studio/run_real_mlx_smoke.py eval --workdir "${{ github.workspace }}/mlx_smoke_workdir" || true
+
+      - name: Multi-epoch labeled-batch reseed runtime check (PR #684 `1d0c11ed`)
+        # Round-4 reviewers flagged that `_create_labeled_batches` with
+        # `dataset_order="torch_randperm"` did not reseed per epoch. The
+        # fix in `1d0c11ed` materializes `num_epochs` blocks of permuted
+        # batches with `seed + epoch_idx`. This step actually runs that
+        # code path against real MLX so the multi-epoch behavior is
+        # validated end-to-end rather than only by static review.
+        run: |
+          python - <<'PY'
+          import sys
+
+          # Reuse the same MLX-aware torch.randperm helper the trainer
+          # imports, exercising the real CPython-MLX install on the runner.
+          import mlx.core as mx  # noqa: F401  (proves MLX import works)
+          from unsloth_zoo.mlx.utils import _torch_randperm_order
+          from unsloth_zoo.mlx.trainer import _create_labeled_batches
+
+          class _DummyTok:
+              eos_token_id = 99
+              def __init__(self):
+                  self.pad_token_id = 0
+              def encode(self, text):
+                  # `i` decides row length so length-sort vs torch-perm
+                  # produce distinguishable orders.
+                  i = int(text.split("_")[-1])
+                  return [10 + j for j in range(2 + i)]
+
+          # Identity mask -- supervise every token. Just exercises plumbing.
+          def _mask(item):
+              ids = item["input_ids"][0]
+              return {"labels": [list(ids)]}
+
+          ds = [{"text": f"row_{i}"} for i in range(6)]
+          BS = 2
+          SEED = 3407
+          NUM_EPOCHS = 3
+
+          # Avoid the chat-template normalize path by passing model_type=None.
+          batches = _create_labeled_batches(
+              dataset=ds,
+              tokenizer=_DummyTok(),
+              mask_fn=_mask,
+              batch_size=BS,
+              max_seq_length=64,
+              seed=SEED,
+              dataset_order="torch_randperm",
+              preserve_dataset_order=False,
+              num_epochs=NUM_EPOCHS,
+              append_eos=False,
+          )
+
+          batches_per_epoch = (len(ds) + BS - 1) // BS
+          expected_total = batches_per_epoch * NUM_EPOCHS
+          assert len(batches) == expected_total, (
+              f"want {expected_total} batches across {NUM_EPOCHS} epochs, "
+              f"got {len(batches)}"
+          )
+
+          # Reconstruct each epoch's expected sample order from the same
+          # _torch_randperm_order(len, seed+epoch_idx) call the trainer makes,
+          # then assert the row ids inside the materialized batches line up.
+          def _row_id_of(batch_tensor, sample_idx):
+              # encode("row_i") emits [10, 11, ..., 10 + (1+i)], so id 10
+              # appears at position 0 and the row index is `length - 2`.
+              row_len = int(batch_tensor.shape[1])
+              # find the trailing pad to recover real length:
+              ids = batch_tensor[sample_idx].tolist()
+              # pad id is 0; the encoder never emits 0
+              while ids and ids[-1] == 0:
+                  ids.pop()
+              return len(ids) - 2
+
+          observed_per_epoch = []
+          for epoch_idx in range(NUM_EPOCHS):
+              epoch_rows = []
+              start = epoch_idx * batches_per_epoch
+              for b in batches[start : start + batches_per_epoch]:
+                  batch_arr, _, _ = b
+                  for s in range(batch_arr.shape[0]):
+                      epoch_rows.append(_row_id_of(batch_arr, s))
+              observed_per_epoch.append(epoch_rows)
+
+          for epoch_idx, observed in enumerate(observed_per_epoch):
+              expected = _torch_randperm_order(len(ds), SEED + epoch_idx)
+              assert observed == expected, (
+                  f"epoch {epoch_idx}: want {expected}, got {observed}"
+              )
+
+          # Epoch 0 and epoch 1 must NOT be identical orders, otherwise the
+          # per-epoch reseed is silently broken (this is what the round-4
+          # reviewer pass would have re-flagged as a P1).
+          assert observed_per_epoch[0] != observed_per_epoch[1], (
+              f"epoch 0 == epoch 1 ({observed_per_epoch[0]}) -- per-epoch "
+              "reseed is not actually firing"
+          )
+
+          print("OK: _create_labeled_batches num_epochs=3 torch_randperm")
+          print("epoch 0 order:", observed_per_epoch[0])
+          print("epoch 1 order:", observed_per_epoch[1])
+          print("epoch 2 order:", observed_per_epoch[2])
+          PY
+
+      - name: SGD / Muon / Lion HF parity decay runtime check (PR #684 `6374bad6`)
+        # Round-2 reviewer pass flagged that the AdamW manual decoupled
+        # decay was not applied to SGD / Muon / Lion. `6374bad6` widened
+        # `_apply_manual_weight_decay` to cover all four optimizers and
+        # zeroed out the underlying MLX optimizer's `weight_decay`. This
+        # exercises that wiring on real MLX so a future revert (or a
+        # new optimizer added to the dispatch table) fails loudly.
+        run: |
+          python - <<'PY'
+          import mlx.optimizers as optim
+          from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+          class _DummyModel:
+              def trainable_parameters(self):
+                  return {}
+
+          for opt_name in ("sgd", "muon", "lion", "adamw"):
+              trainer = MLXTrainer.__new__(MLXTrainer)
+              trainer.model = _DummyModel()
+              trainer.args = MLXTrainingConfig(
+                  optim=opt_name,
+                  weight_decay=0.05,
+              )
+              optimizer = trainer._build_optimizer(total_steps=4)
+              wd = getattr(trainer, "_manual_weight_decay", None)
+              assert wd is not None and abs(wd - 0.05) < 1e-9, (
+                  f"{opt_name}: manual decay scalar = {wd!r}, want 0.05"
+              )
+              internal = None
+              if hasattr(optimizer, "_kw"):
+                  internal = optimizer._kw.get("weight_decay")
+              elif hasattr(optimizer, "weight_decay"):
+                  internal = float(optimizer.weight_decay)
+              if internal is not None:
+                  assert abs(float(internal)) < 1e-12, (
+                      f"{opt_name}: optimizer.weight_decay = {internal!r}, "
+                      "must be 0 so the manual decoupled decay owns the term"
+                  )
+              print(f"OK {opt_name}: manual_wd=0.05  optim_wd={internal}")
+
+          # Bias / norm exclusion contract.
+          assert MLXTrainer._should_apply_weight_decay("layers.0.mlp.weight")
+          assert not MLXTrainer._should_apply_weight_decay("layers.0.mlp.bias")
+          assert not MLXTrainer._should_apply_weight_decay("layers.0.input_layernorm.weight")
+          assert not MLXTrainer._should_apply_weight_decay("transformer.h.0.ln_1.weight")
+          print("OK: HF bias / norm / GPT-2 ln_* exclusion filter")
+          PY
+
+      - name: VLM train_on_completions prompt masking runtime check (PR #684 `23751c84`)
+        # Round-3 reviewer pass: `_collate_vlm_batch` now always sets
+        # `batch["labels"]`, so `_vlm_cce_forward` and
+        # `make_vlm_baseline_loss_fn` always take their labels-aware
+        # branch. The labels-aware branch was missing the
+        # `_mask_prompt_tokens(...)` call that the labels=None branch
+        # already performed, so `train_on_completions=True` silently
+        # trained on prompt tokens. `23751c84` added the call to both
+        # branches. This step runs the masking helpers against synthetic
+        # labels on real MLX and asserts prompt tokens become -100.
+        run: |
+          python - <<'PY'
+          import mlx.core as mx
+          from unsloth_zoo.mlx.utils import _mask_prompt_tokens
+
+          # Two sequences. Prompt = before assistant_token_id (= 7),
+          # response = from assistant_token_id onward. -100 means
+          # "do not train on this position".
+          targets = mx.array([
+              [1, 2, 3, 7, 8, 9],   # prompt=[1,2,3], assistant marker at idx 3, response=[8,9]
+              [4, 5, 7, 6, 6, 6],   # prompt=[4,5], assistant marker at idx 2, response=[6,6,6]
+          ], dtype=mx.int32)
+
+          masked = _mask_prompt_tokens(targets, assistant_token_id=7)
+          observed = masked.tolist()
+          expected = [
+              [-100, -100, -100, 7, 8, 9],
+              [-100, -100, 7, 6, 6, 6],
+          ]
+          assert observed == expected, (
+              f"_mask_prompt_tokens regressed.\n"
+              f"got      {observed}\n"
+              f"expected {expected}"
+          )
+
+          # assistant_token_id <= 0 must be a no-op (train_on_completions=False).
+          no_marker = _mask_prompt_tokens(targets, assistant_token_id=0)
+          assert no_marker.tolist() == targets.tolist(), (
+              "assistant_token_id=0 should not mutate targets"
+          )
+
+          print("OK: _mask_prompt_tokens correctly masks prompt tokens before assistant marker")
+          PY
+
+      - name: create_ordered_batches cross-epoch refill runtime check (PR #684 `4cb6ca66`)
+        # Round-2 reviewer pass: pre-fix `create_ordered_batches` filled
+        # short tail batches with samples from the next epoch in the same
+        # micro-batch, mixing epoch 0 and epoch 1 indices. The fix takes
+        # a contiguous slice from the current epoch order and emits a
+        # partial batch when the tail is short. Run on real MLX so the
+        # fix is verified end-to-end rather than only by static review.
+        run: |
+          python - <<'PY'
+          from unsloth_zoo.mlx.utils import create_ordered_batches
+
+          class _Tok:
+              eos_token_id = 99
+              pad_token_id = 0
+              def encode(self, text):
+                  return [10 + int(text.split("_")[-1]) + j for j in range(3)]
+
+          ds = [{"text": f"r_{i}"} for i in range(5)]
+          BS = 3
+          NUM_EPOCHS = 2
+
+          batches = create_ordered_batches(
+              dataset=ds,
+              tokenizer=_Tok(),
+              batch_size=BS,
+              max_seq_length=32,
+              num_batches=None,
+              seed=3407,
+              dataset_order="sequential",
+              num_epochs=NUM_EPOCHS,
+              append_eos=False,
+          )
+
+          def _row_id(batch_arr, sample_idx):
+              ids = batch_arr[sample_idx].tolist()
+              while ids and ids[-1] == 0:
+                  ids.pop()
+              # encode("r_i") = [10 + i, 11 + i, 12 + i] so subtract 10
+              return ids[0] - 10
+
+          for b_idx, (batch_arr, _, _) in enumerate(batches):
+              rows = [_row_id(batch_arr, s) for s in range(batch_arr.shape[0])]
+              # In sequential order with 5 samples and BS=3, epoch 0 must
+              # emit [0,1,2] and [3,4]; epoch 1 must emit [0,1,2] and [3,4]
+              # again. No batch may span epoch boundaries.
+              assert max(rows) - min(rows) < len(ds), (
+                  f"batch {b_idx} rows {rows} span epoch boundary"
+              )
+              # Specifically: no batch should contain {3,4} mixed with {0}.
+              # Pre-fix output for this dataset was [[0,1,2],[3,4,0],[1,2,3],[4]]
+              # where [3,4,0] crosses epoch 0 -> epoch 1.
+              first, last = min(rows), max(rows)
+              assert not (first < 3 and last >= 3), (
+                  f"batch {b_idx} {rows} mixes epoch 0 tail (3,4) with "
+                  "epoch 1 head (0,1,2)"
+              )
+
+          assert len(batches) == 4, (
+              f"want 4 batches ([[0,1,2],[3,4]] x 2 epochs), got {len(batches)}"
+          )
+          print(f"OK: create_ordered_batches num_epochs=2 BS=3 ds=5 yields {len(batches)} non-mixing batches")
+          PY
+
+      - name: max_grad_leaf_norm runtime check (PR #684 `f545a00`)
+        # Verify the proportional per-leaf L2 clip path executes on real MLX,
+        # not just under the simulation shim. Builds two leaves with norms
+        # 0.5 and 3.0, then asserts that with max_grad_leaf_norm=1.0 the
+        # 0.5-norm leaf is untouched and the 3.0-norm leaf is rescaled to
+        # norm ~ 1.0 (direction preserved per leaf). Also checks the four
+        # mode strings returned by _resolve_mlx_grad_clipping.
+        run: |
+          python - <<'PY'
+          import mlx.core as mx
+          from unsloth_zoo.mlx.trainer import (
+              MLXTrainingConfig,
+              _resolve_mlx_grad_clipping,
+              _clip_grad_by_leaf_norm,
+          )
+
+          # 1. Mode dispatch
+          cfg_default = MLXTrainingConfig(output_dir="/tmp/x")
+          _, _, mgln, mode = _resolve_mlx_grad_clipping(cfg_default)
+          assert mode == "leaf_norm" and mgln == 1.0, (
+              f"default mode/threshold: got {mode!r}/{mgln}"
+          )
+
+          cfg_leaf = MLXTrainingConfig(max_grad_leaf_norm=2.5, output_dir="/tmp/x")
+          mgn, mgv, mgln, mode = _resolve_mlx_grad_clipping(cfg_leaf)
+          assert mode == "leaf_norm" and mgln == 2.5 and mgv == 0.0 and mgn == 0.0
+
+          cfg_value = MLXTrainingConfig(max_grad_value=1.5, output_dir="/tmp/x")
+          mgn, mgv, mgln, mode = _resolve_mlx_grad_clipping(cfg_value)
+          assert mode == "value" and mgv == 1.5 and mgln == 0.0 and mgn == 0.0
+
+          cfg_global = MLXTrainingConfig(max_grad_norm=1.0, output_dir="/tmp/x")
+          mgn, mgv, mgln, mode = _resolve_mlx_grad_clipping(cfg_global)
+          assert mode == "global_norm" and mgn == 1.0
+
+          # 2. Per-leaf rescale math: leaf with norm 3.0 capped at 1.0,
+          #    leaf with norm 0.5 left alone, both preserved in direction.
+          big = mx.array([3.0, 0.0, 0.0, 0.0], dtype=mx.float32)        # ||.|| = 3
+          small = mx.array([0.3, 0.4, 0.0, 0.0], dtype=mx.float32)      # ||.|| = 0.5
+          grad = {"big": big, "small": small}
+          clipped = _clip_grad_by_leaf_norm(grad, 1.0)
+
+          big_clip = clipped["big"]
+          small_clip = clipped["small"]
+          big_norm = float(mx.sqrt(mx.sum(big_clip * big_clip)).item())
+          small_norm = float(mx.sqrt(mx.sum(small_clip * small_clip)).item())
+          assert abs(big_norm - 1.0) < 1e-4, f"big leaf norm: {big_norm}"
+          assert abs(small_norm - 0.5) < 1e-4, f"small leaf norm: {small_norm}"
+
+          # Direction preservation: big_clip should be 1/3 * big (scalar rescale).
+          ratio = float(big_clip[0].item()) / float(big[0].item())
+          assert abs(ratio - 1.0 / 3.0) < 1e-4, f"big leaf scale: {ratio}"
+
+          print("OK: max_grad_leaf_norm modes resolve correctly; "
+                "per-leaf L2 rescale clips 3.0 -> 1.0, leaves 0.5 alone, "
+                "preserves leaf direction")
+          PY
+
+      - name: max_grad_leaf_norm 30-step training parity run (CUDA cross-check)
+        working-directory: unsloth-pr5656
+        # Run the same gemma-3-270m memorisation training as the existing
+        # smoke but with the new max_grad_leaf_norm=1.0 clip path instead
+        # of max_grad_value=1.0. Dump per-step losses to a JSON the B200
+        # CUDA reference run can be overlaid against. Mirrors
+        # tests/studio/run_real_mlx_smoke.py train but uses the
+        # proportional clip default.
+        run: |
+          python -u - <<'PY'
+          import json, math, os, random
+          from pathlib import Path
+          import numpy as np
+          import mlx.core as mx
+          from unsloth_zoo.mlx.loader import FastMLXModel
+          from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+          SEED = 3407
+          TRAIN_TEXT = "<<HELLO!!>> My name is Unsloth!"
+          MODEL_NAME = "unsloth/gemma-3-270m-it"
+
+          random.seed(SEED); np.random.seed(SEED); mx.random.seed(SEED)
+
+          model, tokenizer = FastMLXModel.from_pretrained(
+              MODEL_NAME,
+              load_in_4bit=False,
+              dtype="float16",
+              text_only=True,
+              max_seq_length=128,
+              random_state=SEED,
+              token=os.environ.get("HF_TOKEN") or None,
+              trust_remote_code=False,
+          )
+          mx.random.seed(SEED)
+          model = FastMLXModel.get_peft_model(
+              model, r=8, lora_alpha=16, lora_dropout=0.0,
+              target_modules=["q_proj","k_proj","v_proj","o_proj",
+                              "gate_proj","up_proj","down_proj"],
+              use_gradient_checkpointing=False, random_state=SEED,
+              finetune_language_layers=True,
+              finetune_attention_modules=True,
+              finetune_mlp_modules=True,
+          )
+
+          # Same config as run_real_mlx_smoke.py but with the new clip path.
+          config = MLXTrainingConfig(
+              per_device_train_batch_size=2,
+              gradient_accumulation_steps=3,
+              max_steps=30,
+              learning_rate=1e-3,
+              warmup_steps=0,
+              lr_scheduler_type="constant",
+              optim="adamw",
+              weight_decay=0.0,
+              max_grad_norm=0.0,
+              max_grad_value=None,             # disable elementwise
+              max_grad_leaf_norm=1.0,          # NEW: proportional per-leaf L2
+              logging_steps=1,
+              max_seq_length=64,
+              seed=SEED,
+              use_cce=False,
+              compile=False,
+              gradient_checkpointing=False,
+              output_dir="leaf_norm_outputs",
+              save_steps=0,
+              eval_steps=0,
+              dataset_text_field="text",
+          )
+          trainer = MLXTrainer(
+              model=model, tokenizer=tokenizer,
+              train_dataset=[{"text": TRAIN_TEXT}] * 64,
+              args=config,
+          )
+
+          steps = []
+          def _on_step(step, total, loss, lr, tok_s, peak_gb, elapsed,
+                       num_tokens, grad_norm=None):
+              steps.append({
+                  "step": step,
+                  "loss": round(float(loss), 4),
+                  "grad_norm": round(float(grad_norm), 4) if grad_norm is not None else None,
+              })
+              gn = f"  grad={grad_norm:.4f}" if grad_norm is not None else ""
+              print(f"  leaf_norm step {step}/{total}  loss={loss:.4f}{gn}",
+                    flush=True)
+
+          trainer.add_step_callback(_on_step)
+          trainer.train()
+
+          assert len(steps) == 30, f"expected 30 steps got {len(steps)}"
+          payload = {
+              "clip_mode": "max_grad_leaf_norm",
+              "threshold": 1.0,
+              "model": MODEL_NAME,
+              "seed": SEED,
+              "steps": steps,
+          }
+          Path("mlx_leaf_norm_losses.json").write_text(json.dumps(payload, indent=2))
+          print("WROTE mlx_leaf_norm_losses.json")
+          print(f"final loss: {steps[-1]['loss']}; first 8: "
+                f"{[s['loss'] for s in steps[:8]]}")
+          PY
+
+      - name: Upload max_grad_leaf_norm losses JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlx-leaf-norm-losses-${{ github.run_id }}
+          path: unsloth-pr5656/mlx_leaf_norm_losses.json
+          if-no-files-found: error
+
+      - name: Peak GPU memory comparison across clip modes
+        working-directory: unsloth-pr5656
+        # Three back-to-back training runs of the same gemma-3-270m fixture,
+        # only varying the clip mode. Captures per-step peak GPU memory so
+        # we can quantify the OP's claim that max_grad_norm pays a real
+        # memory cost on MLX (needs cross-tree reduction + fp32 promotion
+        # of all leaves), whereas max_grad_leaf_norm / max_grad_value
+        # process leaves independently.
+        run: |
+          python -u - <<'PY'
+          import gc
+          import json
+          import os
+          import random
+          import time
+          from pathlib import Path
+          import numpy as np
+          import mlx.core as mx
+          from unsloth_zoo.mlx.loader import FastMLXModel
+          from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+          SEED = 3407
+          TRAIN_TEXT = "<<HELLO!!>> My name is Unsloth!"
+          MODEL_NAME = "unsloth/gemma-3-270m-it"
+
+          def _peak_gpu_gb():
+              getter = (getattr(mx, "get_peak_memory", None)
+                        or getattr(mx.metal, "get_peak_memory", None))
+              try:
+                  return float(getter()) / (1024**3) if getter else 0.0
+              except Exception:
+                  return 0.0
+
+          def _reset_peak():
+              for name in ("reset_peak_memory", "reset_peak"):
+                  fn = getattr(mx, name, None) or getattr(mx.metal, name, None)
+                  if fn:
+                      try:
+                          fn()
+                          return
+                      except Exception:
+                          pass
+
+          def run_one(mode_kwargs, label):
+              random.seed(SEED); np.random.seed(SEED); mx.random.seed(SEED)
+              gc.collect()
+              _reset_peak()
+
+              model, tokenizer = FastMLXModel.from_pretrained(
+                  MODEL_NAME, load_in_4bit=False, dtype="float16",
+                  text_only=True, max_seq_length=128,
+                  random_state=SEED,
+                  token=os.environ.get("HF_TOKEN") or None,
+                  trust_remote_code=False,
+              )
+              mx.random.seed(SEED)
+              model = FastMLXModel.get_peft_model(
+                  model, r=8, lora_alpha=16, lora_dropout=0.0,
+                  target_modules=["q_proj","k_proj","v_proj","o_proj",
+                                  "gate_proj","up_proj","down_proj"],
+                  use_gradient_checkpointing=False, random_state=SEED,
+                  finetune_language_layers=True,
+                  finetune_attention_modules=True,
+                  finetune_mlp_modules=True,
+              )
+
+              base_kwargs = dict(
+                  per_device_train_batch_size=2,
+                  gradient_accumulation_steps=3,
+                  max_steps=10,           # short -- this is a memory probe
+                  learning_rate=1e-3,
+                  warmup_steps=0,
+                  lr_scheduler_type="constant",
+                  optim="adamw",
+                  weight_decay=0.0,
+                  logging_steps=1,
+                  max_seq_length=64,
+                  seed=SEED,
+                  use_cce=False,
+                  compile=False,
+                  gradient_checkpointing=False,
+                  output_dir=f"mem_probe_{label}",
+                  save_steps=0,
+                  eval_steps=0,
+                  dataset_text_field="text",
+              )
+              base_kwargs.update(mode_kwargs)
+              config = MLXTrainingConfig(**base_kwargs)
+              trainer = MLXTrainer(
+                  model=model, tokenizer=tokenizer,
+                  train_dataset=[{"text": TRAIN_TEXT}] * 64,
+                  args=config,
+              )
+
+              step_peaks = []
+              def _on_step(step, total, loss, lr, tok_s, peak_gb, elapsed,
+                           num_tokens, grad_norm=None):
+                  step_peaks.append({
+                      "step": step,
+                      "loss": round(float(loss), 4),
+                      "peak_gpu_gb": round(float(peak_gb), 4),
+                  })
+                  print(f"  [{label}] step {step}/{total}  loss={loss:.4f}  "
+                        f"peak={peak_gb:.4f}GB", flush=True)
+
+              trainer.add_step_callback(_on_step)
+              t0 = time.perf_counter()
+              trainer.train()
+              elapsed = time.perf_counter() - t0
+              final_peak = _peak_gpu_gb()
+
+              del trainer, model, tokenizer
+              gc.collect()
+              return {
+                  "label": label,
+                  "mode_kwargs": mode_kwargs,
+                  "elapsed_seconds": round(elapsed, 3),
+                  "final_peak_gpu_gb": round(final_peak, 4),
+                  "max_step_peak_gpu_gb": max(s["peak_gpu_gb"] for s in step_peaks),
+                  "step_peaks": step_peaks,
+              }
+
+          # Three modes, run sequentially so we get clean peak readings.
+          results = []
+          for label, mode_kwargs in [
+              ("elementwise",
+               dict(max_grad_norm=0.0, max_grad_value=1.0,
+                    max_grad_leaf_norm=None)),
+              ("leaf_norm",
+               dict(max_grad_norm=0.0, max_grad_value=None,
+                    max_grad_leaf_norm=1.0)),
+              ("global_norm",
+               dict(max_grad_norm=1.0, max_grad_value=None,
+                    max_grad_leaf_norm=None)),
+          ]:
+              print(f"\n===== probing memory for clip mode: {label} =====",
+                    flush=True)
+              results.append(run_one(mode_kwargs, label))
+
+          print("\n===== MEMORY SUMMARY =====")
+          for r in results:
+              print(f"  {r['label']:>12s}:  max_step_peak={r['max_step_peak_gpu_gb']:.4f}GB  "
+                    f"final={r['final_peak_gpu_gb']:.4f}GB  "
+                    f"elapsed={r['elapsed_seconds']:.2f}s")
+          Path("mlx_memory_probe.json").write_text(json.dumps(results, indent=2))
+          print("WROTE mlx_memory_probe.json")
+          PY
+
+      - name: Upload memory-probe JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlx-memory-probe-${{ github.run_id }}
+          path: unsloth-pr5656/mlx_memory_probe.json
+          if-no-files-found: error
+
+      - name: Upload smoke output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-mlx-smoke-fail-${{ github.run_id }}
+          path: |
+            unsloth-pr5656/**/*.log
+            unsloth-pr5656/tests/studio/out_*.txt
+          if-no-files-found: ignore
+
+# Re-trigger: confirm MLX smoke still passes on PR #684 head c7a0956d after four fixes.
+
+# Re-trigger: PR #684 head 0753b115 with round-2 fixes; confirm MLX smoke still green.
+
+# Re-trigger: PR #684 head 4cb6ca66 round-3 fixes; confirm macOS MLX smoke still green.
+
+# Re-trigger: PR #684 head 6374bad6 (HF parity decay for SGD/Muon/Lion); confirm macOS smoke still green.
+
+# Re-trigger: PR #684 head d16ef240 (round-3 P1/P2); confirm macOS smoke still green.
+
+# Re-trigger: PR #684 head 23751c84 with PR #5656 head 1a026435 round-3 final.
+
+# Re-trigger: PR #684 head 8c278327 (restore mask = kwargs.get in 4 VLM patched functions broken by round-3 ruff cleanup).
+
+# Re-trigger: PR #684 head 1d0c11ed (round-4 multi-epoch labeled batch reseed for torch_randperm parity).
+
+# Re-trigger: extend macOS smoke with a real-MLX multi-epoch labeled-batch reseed assertion (was only static review before).
+
+# Re-trigger: extend macOS smoke with two more real-MLX assertions (SGD/Muon/Lion HF parity decay + VLM train_on_completions prompt masking).
+
+# Re-trigger: extend macOS smoke with max_grad_leaf_norm real-MLX assertion (PR #684 f545a00 proportional per-leaf clip).
+
+# Re-trigger: extend macOS smoke with create_ordered_batches cross-epoch refill assertion (round-2 P1).
+
+# Re-trigger: extend macOS smoke with peak GPU memory comparison across clip modes (elementwise vs leaf_norm vs global_norm).

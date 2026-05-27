@@ -1,0 +1,88 @@
+name: MLX PR validation - compiler.py regression (Linux)
+
+# Validates that unsloth-zoo PR #684 (mmathew23/explore/mlx) reverts the
+# UNSLOTH_RETURN_LOGITS=1 dedicated elif branch that PR #666 added to
+# `unsloth_zoo/compiler.py:cross_entropy_replacement_2`. Runs on a CPU
+# Linux runner with the standard unsloth CUDA spoof (no GPU required).
+
+on:
+  push:
+    branches: [mlx-matthew-validation]
+    paths:
+      - .github/workflows/mlx-compiler-linux.yml
+      - tests/staging_validation/test_compiler_return_logits.py
+  workflow_dispatch:
+
+concurrency:
+  group: mlx-compiler-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  compiler-template-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        zoo-ref:
+          # main = control: expect dedicated elif present  -> PASS
+          # mmathew23:explore/mlx = PR #684: expect missing -> FAIL (the regression)
+          - {label: main,                          repo: unslothai/unsloth-zoo,  ref: main}
+          - {label: 'pr-684 (explore/mlx)',        repo: mmathew23/unsloth-zoo, ref: explore/mlx}
+    name: zoo=${{ matrix.zoo-ref.label }}
+    steps:
+      - name: Checkout staging repo (for tests/)
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install minimal deps
+        run: |
+          python -m pip install --upgrade pip
+          # The regression check now reads unsloth_zoo/compiler.py as
+          # raw text (no import), so we don't need torch / transformers
+          # / triton on the runner. Just install unsloth-zoo from the
+          # requested ref and pytest.
+          python -m pip install pytest
+
+      - name: Install unsloth-zoo @ ${{ matrix.zoo-ref.label }}
+        run: |
+          # --no-deps is required because the regular zoo install pulls
+          # in torch + bitsandbytes etc. We only need the .py text.
+          python -m pip install --no-deps --no-build-isolation --force-reinstall \
+            "git+https://github.com/${{ matrix.zoo-ref.repo }}@${{ matrix.zoo-ref.ref }}"
+          python - <<'PY'
+          import importlib.util, os
+          spec = importlib.util.find_spec("unsloth_zoo")
+          path = os.path.join(spec.submodule_search_locations[0], "compiler.py")
+          print(f"installed compiler.py: {path}")
+          print(f"size: {os.path.getsize(path)} bytes")
+          PY
+
+      - name: Run compiler.py regression check
+        run: |
+          # Both legs must PASS now that the fix landed on
+          # mmathew23:explore/mlx (c7a0956d): the dedicated
+          # UNSLOTH_RETURN_LOGITS=1 elif from PR #666 (f45c31e5) is
+          # restored, so neither main nor the PR head should regress.
+          python -m pytest -x -v tests/staging_validation/test_compiler_return_logits.py
+
+# Re-trigger: PR #684 head updated with fixes (c7a0956d); confirm compiler.py regression now passes.
+
+# Re-trigger: PR #684 head 0753b115 with round-2 fixes (norm cleanup, dataset_order raise, VLM CE parity, scheduler test).
+
+# Re-trigger: PR #684 head 4cb6ca66 (round-2 P1: cross-epoch refill, baseline mask off-by-one, append_eos plumbing, labeled-batches dataset_order honor).
+
+# Re-trigger: PR #684 head 6374bad6 (HF parity decay for SGD/Muon/Lion); confirm compiler regression still green.
+
+# Re-trigger: PR #684 head d16ef240 (round-3 P1/P2: elementwise max_grad_value, iterable VLM raise, Qwen3 vision flag restore, ordered batches pad token).
+
+# Re-trigger: PR #684 head 23751c84 (round-3 P1/P2 final: labeled torch_randperm, num_epochs, norm-patch hardening, VLM completion masking, ruff cleanup).
+
+# Re-trigger: PR #684 head 1d0c11ed; final round-4 head.
