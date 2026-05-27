@@ -93,8 +93,8 @@ def llama():
     cache_dir = Path(os.environ.get("PR5351_GGUF_CACHE", str(Path.home() / ".cache" / "pr5351_gguf")))
     cache_dir.mkdir(parents=True, exist_ok=True)
     # Tiny instruction-tuned model that fits 7 GB CPU runners.
-    repo = "unsloth/Qwen2.5-0.5B-Instruct-GGUF"
-    fname = "Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"
+    repo = "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+    fname = "qwen2.5-0.5b-instruct-q4_k_m.gguf"
     path = hf_hub_download(
         repo_id=repo,
         filename=fname,
@@ -123,7 +123,12 @@ def test_cpu_inference_identifies_extracted_document(extractor, llama, tmp_path)
     ).strip()
     pdf_bytes = _make_text_pdf(body)
 
-    text, figures, *_ = extractor(pdf_bytes)
+    text, figures, *_ = extractor(
+        pdf_bytes,
+        max_figures=0,
+        use_vlm_ocr=False,
+        max_visual_payloads=0,
+    )
     assert "JSON" in text or "Object Notation" in text, (
         f"Extractor lost the body text. Got: {text[:200]!r}"
     )
