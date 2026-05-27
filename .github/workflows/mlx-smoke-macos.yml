@@ -531,6 +531,161 @@ jobs:
           path: unsloth-pr5656/mlx_leaf_norm_losses.json
           if-no-files-found: error
 
+      - name: Peak GPU memory comparison across clip modes
+        working-directory: unsloth-pr5656
+        # Three back-to-back training runs of the same gemma-3-270m fixture,
+        # only varying the clip mode. Captures per-step peak GPU memory so
+        # we can quantify the OP's claim that max_grad_norm pays a real
+        # memory cost on MLX (needs cross-tree reduction + fp32 promotion
+        # of all leaves), whereas max_grad_leaf_norm / max_grad_value
+        # process leaves independently.
+        run: |
+          python -u - <<'PY'
+          import gc
+          import json
+          import os
+          import random
+          import time
+          from pathlib import Path
+          import numpy as np
+          import mlx.core as mx
+          from unsloth_zoo.mlx.loader import FastMLXModel
+          from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+          SEED = 3407
+          TRAIN_TEXT = "<<HELLO!!>> My name is Unsloth!"
+          MODEL_NAME = "unsloth/gemma-3-270m-it"
+
+          def _peak_gpu_gb():
+              getter = (getattr(mx, "get_peak_memory", None)
+                        or getattr(mx.metal, "get_peak_memory", None))
+              try:
+                  return float(getter()) / (1024**3) if getter else 0.0
+              except Exception:
+                  return 0.0
+
+          def _reset_peak():
+              for name in ("reset_peak_memory", "reset_peak"):
+                  fn = getattr(mx, name, None) or getattr(mx.metal, name, None)
+                  if fn:
+                      try:
+                          fn()
+                          return
+                      except Exception:
+                          pass
+
+          def run_one(mode_kwargs, label):
+              random.seed(SEED); np.random.seed(SEED); mx.random.seed(SEED)
+              gc.collect()
+              _reset_peak()
+
+              model, tokenizer = FastMLXModel.from_pretrained(
+                  MODEL_NAME, load_in_4bit=False, dtype="float16",
+                  text_only=True, max_seq_length=128,
+                  random_state=SEED,
+                  token=os.environ.get("HF_TOKEN") or None,
+                  trust_remote_code=False,
+              )
+              mx.random.seed(SEED)
+              model = FastMLXModel.get_peft_model(
+                  model, r=8, lora_alpha=16, lora_dropout=0.0,
+                  target_modules=["q_proj","k_proj","v_proj","o_proj",
+                                  "gate_proj","up_proj","down_proj"],
+                  use_gradient_checkpointing=False, random_state=SEED,
+                  finetune_language_layers=True,
+                  finetune_attention_modules=True,
+                  finetune_mlp_modules=True,
+              )
+
+              base_kwargs = dict(
+                  per_device_train_batch_size=2,
+                  gradient_accumulation_steps=3,
+                  max_steps=10,           # short -- this is a memory probe
+                  learning_rate=1e-3,
+                  warmup_steps=0,
+                  lr_scheduler_type="constant",
+                  optim="adamw",
+                  weight_decay=0.0,
+                  logging_steps=1,
+                  max_seq_length=64,
+                  seed=SEED,
+                  use_cce=False,
+                  compile=False,
+                  gradient_checkpointing=False,
+                  output_dir=f"mem_probe_{label}",
+                  save_steps=0,
+                  eval_steps=0,
+                  dataset_text_field="text",
+              )
+              base_kwargs.update(mode_kwargs)
+              config = MLXTrainingConfig(**base_kwargs)
+              trainer = MLXTrainer(
+                  model=model, tokenizer=tokenizer,
+                  train_dataset=[{"text": TRAIN_TEXT}] * 64,
+                  args=config,
+              )
+
+              step_peaks = []
+              def _on_step(step, total, loss, lr, tok_s, peak_gb, elapsed,
+                           num_tokens, grad_norm=None):
+                  step_peaks.append({
+                      "step": step,
+                      "loss": round(float(loss), 4),
+                      "peak_gpu_gb": round(float(peak_gb), 4),
+                  })
+                  print(f"  [{label}] step {step}/{total}  loss={loss:.4f}  "
+                        f"peak={peak_gb:.4f}GB", flush=True)
+
+              trainer.add_step_callback(_on_step)
+              t0 = time.perf_counter()
+              trainer.train()
+              elapsed = time.perf_counter() - t0
+              final_peak = _peak_gpu_gb()
+
+              del trainer, model, tokenizer
+              gc.collect()
+              return {
+                  "label": label,
+                  "mode_kwargs": mode_kwargs,
+                  "elapsed_seconds": round(elapsed, 3),
+                  "final_peak_gpu_gb": round(final_peak, 4),
+                  "max_step_peak_gpu_gb": max(s["peak_gpu_gb"] for s in step_peaks),
+                  "step_peaks": step_peaks,
+              }
+
+          # Three modes, run sequentially so we get clean peak readings.
+          results = []
+          for label, mode_kwargs in [
+              ("elementwise",
+               dict(max_grad_norm=0.0, max_grad_value=1.0,
+                    max_grad_leaf_norm=None)),
+              ("leaf_norm",
+               dict(max_grad_norm=0.0, max_grad_value=None,
+                    max_grad_leaf_norm=1.0)),
+              ("global_norm",
+               dict(max_grad_norm=1.0, max_grad_value=None,
+                    max_grad_leaf_norm=None)),
+          ]:
+              print(f"\n===== probing memory for clip mode: {label} =====",
+                    flush=True)
+              results.append(run_one(mode_kwargs, label))
+
+          print("\n===== MEMORY SUMMARY =====")
+          for r in results:
+              print(f"  {r['label']:>12s}:  max_step_peak={r['max_step_peak_gpu_gb']:.4f}GB  "
+                    f"final={r['final_peak_gpu_gb']:.4f}GB  "
+                    f"elapsed={r['elapsed_seconds']:.2f}s")
+          Path("mlx_memory_probe.json").write_text(json.dumps(results, indent=2))
+          print("WROTE mlx_memory_probe.json")
+          PY
+
+      - name: Upload memory-probe JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlx-memory-probe-${{ github.run_id }}
+          path: unsloth-pr5656/mlx_memory_probe.json
+          if-no-files-found: error
+
       - name: Upload smoke output on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -564,3 +719,5 @@ jobs:
 # Re-trigger: extend macOS smoke with max_grad_leaf_norm real-MLX assertion (PR #684 f545a00 proportional per-leaf clip).
 
 # Re-trigger: extend macOS smoke with create_ordered_batches cross-epoch refill assertion (round-2 P1).
+
+# Re-trigger: extend macOS smoke with peak GPU memory comparison across clip modes (elementwise vs leaf_norm vs global_norm).
