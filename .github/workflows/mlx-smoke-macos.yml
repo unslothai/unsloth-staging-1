@@ -209,12 +209,11 @@ jobs:
           PY
 
       - name: SGD / Muon / Lion HF parity decay runtime check (PR #684 `6374bad6`)
-        # Round-2 reviewer pass flagged that the AdamW manual decoupled
-        # decay was not applied to SGD / Muon / Lion. `6374bad6` widened
-        # `_apply_manual_weight_decay` to cover all four optimizers and
-        # zeroed out the underlying MLX optimizer's `weight_decay`. This
-        # exercises that wiring on real MLX so a future revert (or a
-        # new optimizer added to the dispatch table) fails loudly.
+        # Muon / Lion / AdamW use the manual decoupled decay; SGD now folds
+        # decay into the gradient before momentum (coupled), matching
+        # torch.optim.SGD and MLX SGD semantics (review fix c8ad7dd7).
+        # Either way the built-in MLX optimizer decay must stay 0 so the
+        # trainer owns the term and the bias/norm exemption applies.
         run: |
           python - <<'PY'
           import mlx.optimizers as optim
@@ -232,10 +231,18 @@ jobs:
                   weight_decay=0.05,
               )
               optimizer = trainer._build_optimizer(total_steps=4)
-              wd = getattr(trainer, "_manual_weight_decay", None)
-              assert wd is not None and abs(wd - 0.05) < 1e-9, (
-                  f"{opt_name}: manual decay scalar = {wd!r}, want 0.05"
-              )
+              manual = getattr(trainer, "_manual_weight_decay", None) or 0.0
+              coupled = getattr(trainer, "_coupled_weight_decay", None) or 0.0
+              if opt_name == "sgd":
+                  assert abs(coupled - 0.05) < 1e-9 and manual == 0.0, (
+                      f"sgd: coupled={coupled!r} manual={manual!r}, "
+                      "want coupled=0.05 manual=0 (grad-coupled like torch SGD)"
+                  )
+              else:
+                  assert abs(manual - 0.05) < 1e-9 and coupled == 0.0, (
+                      f"{opt_name}: manual={manual!r} coupled={coupled!r}, "
+                      "want manual=0.05 coupled=0 (decoupled decay)"
+                  )
               internal = None
               if hasattr(optimizer, "_kw"):
                   internal = optimizer._kw.get("weight_decay")
@@ -244,9 +251,9 @@ jobs:
               if internal is not None:
                   assert abs(float(internal)) < 1e-12, (
                       f"{opt_name}: optimizer.weight_decay = {internal!r}, "
-                      "must be 0 so the manual decoupled decay owns the term"
+                      "must be 0 so the trainer owns the decay term"
                   )
-              print(f"OK {opt_name}: manual_wd=0.05  optim_wd={internal}")
+              print(f"OK {opt_name}: manual={manual} coupled={coupled} optim_wd={internal}")
 
           # Bias / norm exclusion contract.
           assert MLXTrainer._should_apply_weight_decay("layers.0.mlp.weight")
